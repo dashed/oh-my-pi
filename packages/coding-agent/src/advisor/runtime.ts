@@ -80,6 +80,11 @@ export interface AdvisorRuntimeHost {
 	notifyQuotaExhausted?(): void;
 	/** Stable identity for the live advisor model. Used to restore full transcript rendering after a model switch. */
 	getModelIdentity?(): string;
+	/**
+	 * Names of the tools this advisor is actually granted (e.g. `["advise", "read", "grep", "glob"]`).
+	 * Used to build the one-shot tightened instruction sent with the automatic quarantine retry.
+	 */
+	grantedToolNames?(): readonly string[];
 }
 
 /**
