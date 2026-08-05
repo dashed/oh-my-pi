@@ -37,6 +37,7 @@ import type { HookSelectorComponent, HookSelectorOptions } from "./components/ho
 import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import type { TranscriptContainer } from "./components/transcript-container";
+import type { WorkingIndicator } from "./components/working-indicator";
 import type { EventController } from "./controllers/event-controller";
 import type { LoopLimitRuntime } from "./loop-limit";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
@@ -202,7 +203,7 @@ export interface InteractiveModeContext {
 	 * Reseeded by `renderSessionContext` on every rebuild/session switch.
 	 */
 	lastAssistantUsage: Usage | undefined;
-	loadingAnimation: Loader | undefined;
+	loadingAnimation: WorkingIndicator | undefined;
 	autoCompactionLoader: Loader | undefined;
 	retryLoader: Loader | undefined;
 	unsubscribe?: () => void;

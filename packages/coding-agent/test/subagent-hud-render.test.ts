@@ -207,17 +207,27 @@ describe("subagent HUD lines", () => {
 		expect(activeIds()).toEqual(["SelectorSurfaces", "BlastRadius", "VariantsSurvey"]);
 	});
 
-	it("appends the tool currently in flight as a truncated dim suffix", () => {
+	it("appends the tool currently in flight as a truncated dim activity suffix", () => {
 		const out = render([
 			makeSession({
 				id: "Worker",
 				description: "live work",
-				progress: makeProgress({ id: "Worker", currentTool: "bash" }),
+				progress: makeProgress({ id: "Worker", currentTool: "bash", currentToolArgs: "bun test" }),
 			}),
 		]);
 		expect(out).toContain("Worker: live work");
-		expect(out).toContain("· bash");
+		expect(out).toContain("· Running bun test");
 
+		const read = render([
+			makeSession({
+				id: "Worker",
+				description: "live work",
+				progress: makeProgress({ id: "Worker", currentTool: "read", currentToolArgs: "src/foo.ts" }),
+			}),
+		]);
+		expect(read).toContain("· Reading src/foo.ts");
+
+		// Unknown tools fall back to the raw name, truncated as before.
 		const longTool = `tool-${"x".repeat(100)}`;
 		const truncated = render([
 			makeSession({
@@ -315,7 +325,10 @@ describe("InteractiveMode subagent observer UI sync", () => {
 		}
 
 		await Promise.resolve();
-		vi.runAllTimers();
+		// Bounded advance (not runAllTimers): the HUD keep-alive interval started
+		// by the observer flush would otherwise tick forever. 150ms clears the
+		// 100ms coalesce window without reaching the 1s keep-alive.
+		vi.advanceTimersByTime(150);
 		await Promise.resolve();
 
 		const hud = Bun.stripANSI(mode.subagentContainer.render(120).join("\n"));

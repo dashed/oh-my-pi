@@ -3,7 +3,6 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
 import { logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
-import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
 import { getEditClipboard } from "../../edit/edit-clipboard";
@@ -26,14 +25,13 @@ import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "t
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
-import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
+import { formatToolActivity, previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
 import { nextActionableTask } from "../../tools/todo";
 import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { setTerminalTitleState } from "../../utils/title-generator";
-import { interruptHint } from "../shared";
 import { createAssistantMessageComponent } from "../utils/interactive-context-helpers";
 import {
 	assistantHasVisibleContent,
@@ -83,7 +81,6 @@ export class EventController {
 	// reads collapses into one group even across completion boundaries.
 	#lastVisibleBlockCount = 0;
 	#renderedCustomMessages = new Set<string>();
-	#lastIntent: string | undefined = undefined;
 	#backgroundTaskCallIds = new Set<string>();
 	/** Tool calls whose approval prompt drove the title into `attention`; cleared
 	 *  at their tool_execution_end so the title returns to `working`. */
@@ -438,17 +435,6 @@ export class EventController {
 		return component;
 	}
 
-	#updateWorkingMessageFromIntent(intent: unknown): void {
-		if (this.ctx.session.isAborting) return;
-		// Streamed JSON can deliver non-string `i` (object, number, boolean) before
-		// schema validation; `?.` only guards null/undefined, so guard the type too.
-		if (typeof intent !== "string") return;
-		const trimmed = intent.trim();
-		if (!trimmed || trimmed === this.#lastIntent) return;
-		this.#lastIntent = trimmed;
-		this.ctx.setWorkingMessage(`${trimmed}${interruptHint()}`);
-	}
-
 	subscribeToAgent(): void {
 		// Serialize non-update dispatch behind any in-flight handler run:
 		// AgentSession.#emit fires listeners fire-and-forget (it does not await
@@ -540,6 +526,13 @@ export class EventController {
 	 * snapshot is (possibly) superseded by a newer one.
 	 */
 	#enqueueMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): void {
+		// Fold the cumulative usage snapshot into the working indicator at
+		// arrival (not in the coalesced handler): TTFT must time the FIRST
+		// positive output delta and the tok/s gauge wants every per-delta rate,
+		// including snapshots the coalescing window later supersedes.
+		if (event.message.role === "assistant") {
+			this.ctx.loadingAnimation?.recordUsage(event.message.usage.output, event.message.upstreamProvider);
+		}
 		// Speech is per-delta: every delta is spoken at arrival even when its
 		// cumulative snapshot is later superseded and never rebuilt.
 		this.#vocalizeDelta(event);
@@ -594,7 +587,6 @@ export class EventController {
 		this.#resetReadGroup();
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
-		this.#lastIntent = undefined;
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
@@ -693,7 +685,6 @@ export class EventController {
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
-		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#resetReadGroup();
@@ -714,6 +705,7 @@ export class EventController {
 		this.ctx.statusLine.markActivityStart();
 		this.#setTerminalProgress(true);
 		this.ctx.ensureLoadingAnimation();
+		this.ctx.loadingAnimation?.beginTurn();
 		setTerminalTitleState("working");
 		this.ctx.ui.requestRender();
 	}
@@ -1112,27 +1104,6 @@ export class EventController {
 				this.#upsertPostToolAssistantSegment(toolCallId, segment);
 			}
 
-			// Update working message with intent from streamed tool arguments
-			for (const content of this.ctx.streamingMessage.content) {
-				if (content.type !== "toolCall") continue;
-				const args = content.arguments;
-				if (!args || typeof args !== "object") continue;
-				if (INTENT_FIELD in args) {
-					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD]);
-					continue;
-				}
-				const tool = this.ctx.viewSession.getToolByName(content.name);
-				if (typeof tool?.intent !== "function") continue;
-				try {
-					const derived = tool.intent(args as never)?.trim();
-					if (derived) {
-						this.#updateWorkingMessageFromIntent(derived);
-					}
-				} catch {
-					// intent function must never break the UI
-				}
-			}
-
 			this.ctx.ui.requestRender();
 		}
 	}
@@ -1294,7 +1265,12 @@ export class EventController {
 	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {
 		if (this.#retractedToolCallIds.has(event.toolCallId)) return;
 		this.#ensureWorkingLoaderWhileStreaming();
-		this.#updateWorkingMessageFromIntent(event.intent);
+		// Late starts during an abort wind-down must not churn the indicator
+		// label (parity with the superseded intent-message guard); the turn's
+		// teardown hides the indicator moments later anyway.
+		if (!this.ctx.session.isAborting) {
+			this.ctx.loadingAnimation?.setToolActivity(event.toolCallId, formatToolActivity(event.toolName, event.args));
+		}
 		if (event.toolName === "ask" || this.#toolWillPromptForApproval(event.toolName, event.args)) {
 			this.#approvalAttentionToolCallIds.add(event.toolCallId);
 			setTerminalTitleState("attention");
@@ -1446,6 +1422,7 @@ export class EventController {
 	}
 
 	async #handleToolExecutionEnd(event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): Promise<void> {
+		this.ctx.loadingAnimation?.clearToolActivity(event.toolCallId);
 		// `createAbortedToolResult` emits start/end after an error/aborted
 		// assistant message. The matching card was deliberately retracted at
 		// message_end; consume the completion instead of recreating/updating UI.

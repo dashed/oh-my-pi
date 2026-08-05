@@ -18,7 +18,6 @@ import type {
 	AutocompleteProvider,
 	Component,
 	EditorTheme,
-	LoaderMessageColorFn,
 	NativeScrollbackLiveRegion,
 	OverlayHandle,
 	SlashCommand,
@@ -26,7 +25,7 @@ import type {
 import {
 	Container,
 	clearRenderCache,
-	Loader,
+	type Loader,
 	Markdown,
 	ProcessTerminal,
 	Spacer,
@@ -120,7 +119,7 @@ import type { ConfiguredThinkingLevel } from "../thinking";
 import { tinyTitleClient } from "../tiny/title-client";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
-import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
+import { formatToolActivity, replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import {
 	formatPhaseDisplayName,
@@ -165,6 +164,7 @@ import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import { TranscriptContainer } from "./components/transcript-container";
 import { WelcomeComponent, type LspServerInfo as WelcomeLspServerInfo } from "./components/welcome";
+import { WorkingIndicator, type WorkingMessageAccent } from "./components/working-indicator";
 import { BtwController } from "./controllers/btw-controller";
 import { CommandController } from "./controllers/command-controller";
 import { EventController } from "./controllers/event-controller";
@@ -196,9 +196,7 @@ import {
 } from "./session-observer-registry";
 import { createSessionTeardown, type SessionTeardown } from "./session-teardown";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
-import { interruptHint } from "./shared";
 import { clearMermaidCache } from "./theme/mermaid-cache";
-import { type ShimmerPalette, shimmerEnabled, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
 import {
 	getEditorTheme,
@@ -225,57 +223,10 @@ import { isWarpCliAgentProtocolActive } from "./warp-events";
 
 const STILL_CLOSING_DELAY_MS = 3_000;
 
-const HINT_SHIMMER_PALETTE: ShimmerPalette = {
-	low: "dim",
-	mid: "muted",
-	high: "borderAccent",
-};
-
-interface WorkingMessageAccent {
-	main: string;
-	dim: string;
-}
-
 interface WorkingMessageAccentCacheKey {
 	sessionName: string | undefined;
 	accentSurfaceLuminance: number | undefined;
 	sessionAccentEnabled: boolean;
-}
-
-/**
- * Intern the shimmer palettes for each `WorkingMessageAccent` so `compile()`
- * inside `shimmerSegments` sees a stable palette object between animation
- * ticks. Allocating fresh palette literals every frame guaranteed a cache miss
- * on the Symbol-keyed compiled-ANSI slot and forced `resolveTierAnsi` to walk
- * every tier open/close for the ~30fps loader redraw (issue #4377).
- */
-const workingMessagePaletteCache = new WeakMap<WorkingMessageAccent, { main: ShimmerPalette; hint: ShimmerPalette }>();
-
-function workingMessagePalettes(accent: WorkingMessageAccent): { main: ShimmerPalette; hint: ShimmerPalette } {
-	let entry = workingMessagePaletteCache.get(accent);
-	if (!entry) {
-		entry = {
-			main: { low: "dim", mid: { ansi: accent.main }, high: { ansi: accent.main }, bold: true },
-			hint: { low: "dim", mid: { ansi: accent.dim }, high: { ansi: accent.dim } },
-		};
-		workingMessagePaletteCache.set(accent, entry);
-	}
-	return entry;
-}
-
-function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): string {
-	const palettes = accent ? workingMessagePalettes(accent) : undefined;
-	const palette = palettes?.main;
-	const hint = interruptHint();
-	if (!message.endsWith(hint)) return shimmerText(message, theme, palette);
-	const header = message.slice(0, -hint.length);
-	return shimmerSegments(
-		[
-			{ text: header, palette },
-			{ text: hint, palette: palettes?.hint ?? HINT_SHIMMER_PALETTE },
-		],
-		theme,
-	);
 }
 
 const EDITOR_MAX_HEIGHT_MIN = 6;
@@ -381,6 +332,10 @@ const MODEL_CYCLE_TRACK_CLEAR_MS = 4000;
 
 const SUBAGENT_HUD_VISIBLE_LIMIT = 8;
 const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
+/** Keep-alive cadence for time-derived status content (working-indicator
+ *  elapsed, subagent HUD rows) while a turn or subagent is active — mirrors the
+ *  agent hub's `#ageTimer`. */
+const HUD_TICK_MS = 1000;
 
 /**
  * Build the anchored subagent HUD block: a bold accent "Subagents" header plus
@@ -423,7 +378,10 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 				}
 				const currentTool = session.progress?.currentTool?.trim();
 				if (currentTool) {
-					line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(currentTool), TRUNCATE_LENGTHS.SHORT))}`;
+					// Shared "Reading src/foo.ts"-style activity label (same formatter
+					// the working indicator uses); unknown tools keep the raw name.
+					const activity = formatToolActivity(currentTool, session.progress?.currentToolArgs) ?? currentTool;
+					line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(activity), TRUNCATE_LENGTHS.SHORT))}`;
 				}
 				return line;
 			},
@@ -521,16 +479,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	streamingComponent: AssistantMessageComponent | undefined = undefined;
 	streamingMessage: AssistantMessage | undefined = undefined;
 	lastAssistantUsage: Usage | undefined = undefined;
-	loadingAnimation: Loader | undefined = undefined;
+	loadingAnimation: WorkingIndicator | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
 	#pendingWorkingMessage: string | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
 	#workingMessageAccentCacheValue?: WorkingMessageAccent;
 	#workingMessageAccentCacheHasValue = false;
-	get #defaultWorkingMessage(): string {
-		return `Working…${interruptHint()}`;
-	}
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
@@ -667,6 +622,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#observerUiSyncTimer?: NodeJS.Timeout;
 	#observerUiSyncNeedsTodoReconcile = false;
+	#hudTickTimer?: NodeJS.Timeout;
 	#agentRegistryUnsubscribe?: () => void;
 	#agentRegistrySubscriptionTarget?: AgentRegistry;
 	/** `id:status` keys of subagent terminal transitions already notified. */
@@ -2140,6 +2096,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#renderTodoList();
 		this.#renderSubagentList();
 		this.ui.requestRender();
+		this.#syncHudTickTimer();
 	}
 
 	#cancelObserverUiSyncTimer(): void {
@@ -2148,6 +2105,49 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#observerUiSyncTimer = undefined;
 		}
 		this.#observerUiSyncNeedsTodoReconcile = false;
+		if (this.#hudTickTimer) {
+			clearInterval(this.#hudTickTimer);
+			this.#hudTickTimer = undefined;
+		}
+	}
+
+	#hasRunningSubagentSessions(): boolean {
+		return this.#observerRegistry
+			.getSessions()
+			.some(session => session.kind === "subagent" && session.status === "active");
+	}
+
+	/**
+	 * One shared 1s keep-alive for time-derived status content — the working
+	 * indicator's elapsed stats and the subagent HUD rows — running only while a
+	 * turn or subagent is active (the agent hub's `#ageTimer` precedent). The
+	 * indicator derives its frame from the clock at render time, so a bare
+	 * repaint refreshes it; subagent rows rebuild from the latest observer
+	 * snapshots via the regular flush. The tick re-evaluates its own need every
+	 * firing, so a loader stopped through a path that skips `#syncHudTickTimer`
+	 * (transient-UI teardown, command controllers) still lets the timer die.
+	 */
+	#syncHudTickTimer(): void {
+		const subagentsActive = this.#hasRunningSubagentSessions();
+		const needed = this.loadingAnimation !== undefined || subagentsActive;
+		if (!needed) {
+			if (this.#hudTickTimer) {
+				clearInterval(this.#hudTickTimer);
+				this.#hudTickTimer = undefined;
+			}
+			return;
+		}
+		if (this.#hudTickTimer) return;
+		this.#hudTickTimer = setInterval(() => {
+			this.#syncHudTickTimer();
+			if (!this.#hudTickTimer) return;
+			if (this.#hasRunningSubagentSessions()) {
+				this.#flushObserverUiSync();
+			} else {
+				this.ui.requestRender();
+			}
+		}, HUD_TICK_MS);
+		this.#hudTickTimer.unref?.();
 	}
 
 	#renderTodoList(): void {
@@ -4363,24 +4363,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.loadingAnimation) {
 			this.#clearWorkingMessageAccentCache();
 			this.statusContainer.disposeChildren();
-			const messageColorFn = ((message: string) =>
-				renderWorkingMessage(message, this.#getWorkingMessageAccent())) as LoaderMessageColorFn & {
-				animated?: true;
-			};
-			// Shimmer drives the 30fps redraw; when it is disabled the working
-			// message is static, so leave `animated` unset and let the loader use
-			// the spinner-only ~12.5fps cadence instead of repainting a frozen line.
-			if (shimmerEnabled()) messageColorFn.animated = true;
-			this.loadingAnimation = new Loader(
-				this.ui,
-				spinner => {
-					const accent = this.#getWorkingMessageAccent();
-					return accent ? `${accent.main}${spinner}\x1b[39m` : theme.fg("accent", spinner);
-				},
-				messageColorFn,
-				this.#defaultWorkingMessage,
-				getSymbolTheme().spinnerFrames,
-			);
+			this.loadingAnimation = new WorkingIndicator(this.ui, {
+				getAccent: () => this.#getWorkingMessageAccent(),
+				spinnerFrames: getSymbolTheme().spinnerFrames,
+			});
 			this.statusContainer.addChild(this.loadingAnimation);
 		} else if (!this.statusContainer.children.includes(this.loadingAnimation)) {
 			this.statusContainer.disposeChildren();
@@ -4388,6 +4374,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.requestRender();
 		}
 		this.applyPendingWorkingMessage();
+		this.#syncHudTickTimer();
 	}
 
 	#stopLoadingAnimation(clearStatusContainer: boolean): void {
@@ -4398,14 +4385,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (clearStatusContainer) {
 			this.statusContainer.disposeChildren();
 		}
+		this.#syncHudTickTimer();
 	}
 
 	setWorkingMessage(message?: string): void {
 		if (message === undefined) {
 			this.#pendingWorkingMessage = undefined;
-			if (this.loadingAnimation) {
-				this.loadingAnimation.setMessage(this.#defaultWorkingMessage);
-			}
+			this.loadingAnimation?.setMessage(undefined);
 			return;
 		}
 

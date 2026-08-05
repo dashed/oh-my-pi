@@ -7,7 +7,24 @@ import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-
 
 interface FakeWorkingLoader {
 	stop: Mock<() => void>;
+	beginTurn: Mock<() => void>;
+	setMessage: Mock<(message?: string) => void>;
+	setToolActivity: Mock<(toolCallId: string, label: string | undefined) => void>;
+	clearToolActivity: Mock<(toolCallId: string) => void>;
+	recordUsage: Mock<(outputTokens: number, upstreamProvider?: string) => void>;
 	kind: "working";
+}
+
+function makeFakeWorkingLoader(): FakeWorkingLoader {
+	return {
+		stop: vi.fn(),
+		beginTurn: vi.fn(),
+		setMessage: vi.fn(),
+		setToolActivity: vi.fn(),
+		clearToolActivity: vi.fn(),
+		recordUsage: vi.fn(),
+		kind: "working",
+	};
 }
 
 /**
@@ -92,7 +109,7 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 	ctx.ensureLoadingAnimation = vi.fn(() => {
 		if (ctx.loadingAnimation) return;
 		statusContainer.clear();
-		const working: FakeWorkingLoader = { stop: vi.fn(), kind: "working" };
+		const working = makeFakeWorkingLoader();
 		workingLoaders.push(working);
 		ctx.loadingAnimation = working as unknown as typeof ctx.loadingAnimation;
 		statusContainer.addChild(ctx.loadingAnimation);

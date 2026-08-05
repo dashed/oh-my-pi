@@ -13,7 +13,14 @@ import { TERMINAL } from "@oh-my-pi/pi-tui";
  */
 function createContext() {
 	const streamState = { isStreaming: false };
-	const loader = { stop: vi.fn() };
+	const loader = {
+		stop: vi.fn(),
+		beginTurn: vi.fn(),
+		setMessage: vi.fn(),
+		setToolActivity: vi.fn(),
+		clearToolActivity: vi.fn(),
+		recordUsage: vi.fn(),
+	};
 	const ctx = {
 		isInitialized: true,
 		settings: { get: () => false },

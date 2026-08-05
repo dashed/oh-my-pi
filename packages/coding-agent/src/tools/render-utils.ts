@@ -145,6 +145,62 @@ export function getDomain(url: string): string {
 export { formatAge, formatBytes, formatCount, formatDuration, pluralize } from "@oh-my-pi/pi-utils";
 
 // =============================================================================
+// Tool Activity Formatting
+// =============================================================================
+
+/** Gerund verbs for the live "what is the agent doing" label, keyed by tool name. */
+const TOOL_ACTIVITY_VERBS: Record<string, string> = {
+	read: "Reading",
+	write: "Writing",
+	edit: "Editing",
+	bash: "Running",
+	grep: "Searching",
+	glob: "Searching",
+	fetch: "Fetching",
+	web_search: "Searching",
+	task: "Delegating",
+	todo: "Planning",
+};
+
+/** Arg keys carrying the most recognizable per-tool target, in priority order
+ *  (mirrors the task executor's progress-preview key order). */
+const TOOL_ACTIVITY_DETAIL_KEYS = ["command", "file_path", "path", "pattern", "query", "url", "task", "prompt"] as const;
+
+/**
+ * One-line "Reading src/foo.ts"-style label for a tool currently in flight, or
+ * `undefined` when the tool has no known verb — callers fall back to a generic
+ * gerund. `args` accepts either the raw tool-call arguments (at
+ * `tool_execution_start`) or the pre-extracted string preview carried by
+ * subagent progress snapshots. Detail text is tab-expanded, whitespace-collapsed,
+ * and width-truncated so the label is always a single safe line.
+ */
+export function formatToolActivity(
+	toolName: string,
+	args?: unknown,
+	maxDetailWidth: number = TRUNCATE_LENGTHS.SHORT,
+): string | undefined {
+	const verb = TOOL_ACTIVITY_VERBS[toolName];
+	if (!verb) return undefined;
+	let detail: string | undefined;
+	if (typeof args === "string") {
+		detail = args;
+	} else if (args && typeof args === "object") {
+		const record = args as Record<string, unknown>;
+		for (const key of TOOL_ACTIVITY_DETAIL_KEYS) {
+			const value = record[key];
+			if (typeof value === "string" && value.trim().length > 0) {
+				detail = value;
+				break;
+			}
+		}
+	}
+	if (!detail) return verb;
+	const collapsed = replaceTabs(detail).replace(/\s+/g, " ").trim();
+	if (!collapsed) return verb;
+	return `${verb} ${truncateToWidth(collapsed, maxDetailWidth)}`;
+}
+
+// =============================================================================
 // Theme Helper Utilities
 // =============================================================================
 

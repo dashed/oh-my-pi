@@ -10,6 +10,14 @@ function createContext() {
 	const setWorkingMessage = vi.fn();
 	const ensureLoadingAnimation = vi.fn();
 	const pendingTools = new Map<string, unknown>();
+	const indicator = {
+		beginTurn: vi.fn(),
+		setMessage: vi.fn(),
+		setToolActivity: vi.fn(),
+		clearToolActivity: vi.fn(),
+		recordUsage: vi.fn(),
+		stop: vi.fn(),
+	};
 	const session = {
 		getToolByName: () => undefined,
 		isAborting: false,
@@ -30,25 +38,25 @@ function createContext() {
 		setWorkingMessage,
 		clearPinnedError: vi.fn(),
 		ensureLoadingAnimation,
+		loadingAnimation: indicator,
 		ui: { requestRender: vi.fn() },
 		session,
 		viewSession: session,
 	} as unknown as InteractiveModeContext;
-	return { ctx, pendingTools, setWorkingMessage, session };
+	return { ctx, pendingTools, setWorkingMessage, indicator, session };
 }
 
 const AGENT_START = { type: "agent_start" } as unknown as AgentSessionEvent;
 
 /** A `tool_execution_start` whose toolCallId is pre-seeded into `pendingTools`,
- *  so the handler only runs the intent->working-message path and skips component
+ *  so the handler only runs the activity-label path and skips component
  *  construction (which needs far heavier mocks). */
-function toolStartWithIntent(toolCallId: string, intent: string): AgentSessionEvent {
+function toolStartWithArgs(toolCallId: string, args: Record<string, unknown>): AgentSessionEvent {
 	return {
 		type: "tool_execution_start",
 		toolCallId,
 		toolName: "grep",
-		args: {},
-		intent,
+		args,
 	} as unknown as AgentSessionEvent;
 }
 
@@ -88,47 +96,48 @@ describe("EventController aborted-turn working messages", () => {
 		expect(clear).toHaveBeenCalledTimes(1);
 	});
 
-	it("suppresses late intent-driven working-message updates while aborting", async () => {
-		const { ctx, pendingTools, setWorkingMessage, session } = createContext();
+	it("suppresses late tool-activity updates while aborting", async () => {
+		const { ctx, pendingTools, indicator, session } = createContext();
 		const controller = new EventController(ctx);
 		await controller.handleEvent(AGENT_START);
-		setWorkingMessage.mockClear();
+		indicator.setToolActivity.mockClear();
 		session.isAborting = true;
 
 		pendingTools.set("late-call", {});
-		await controller.handleEvent(toolStartWithIntent("late-call", "Reticulating splines"));
+		await controller.handleEvent(toolStartWithArgs("late-call", { pattern: "splines" }));
 
-		expect(setWorkingMessage).not.toHaveBeenCalled();
+		expect(indicator.setToolActivity).not.toHaveBeenCalled();
 	});
 
-	it("lets intent updates drive the loader when not aborting", async () => {
-		const { ctx, pendingTools, setWorkingMessage } = createContext();
+	it("lets tool starts drive the indicator activity label when not aborting", async () => {
+		const { ctx, pendingTools, indicator } = createContext();
 		const controller = new EventController(ctx);
 		await controller.handleEvent(AGENT_START);
-		setWorkingMessage.mockClear();
+		indicator.setToolActivity.mockClear();
 
 		pendingTools.set("call-1", {});
-		await controller.handleEvent(toolStartWithIntent("call-1", "Searching files"));
+		await controller.handleEvent(toolStartWithArgs("call-1", { pattern: "files" }));
 
-		expect(setWorkingMessage).toHaveBeenCalledTimes(1);
-		expect(setWorkingMessage.mock.calls[0]?.[0]).toContain("Searching files");
+		expect(indicator.setToolActivity).toHaveBeenCalledTimes(1);
+		expect(indicator.setToolActivity.mock.calls[0]?.[0]).toBe("call-1");
+		expect(indicator.setToolActivity.mock.calls[0]?.[1]).toBe("Searching files");
 	});
 
-	it("resumes intent updates once aborting clears", async () => {
-		const { ctx, pendingTools, setWorkingMessage, session } = createContext();
+	it("resumes activity updates once aborting clears", async () => {
+		const { ctx, pendingTools, indicator, session } = createContext();
 		const controller = new EventController(ctx);
 		await controller.handleEvent(AGENT_START);
 		session.isAborting = true;
 
 		pendingTools.set("late-call", {});
-		await controller.handleEvent(toolStartWithIntent("late-call", "Reticulating splines"));
-		setWorkingMessage.mockClear();
+		await controller.handleEvent(toolStartWithArgs("late-call", { pattern: "splines" }));
+		indicator.setToolActivity.mockClear();
 		session.isAborting = false;
 
 		pendingTools.set("call-2", {});
-		await controller.handleEvent(toolStartWithIntent("call-2", "Editing module"));
+		await controller.handleEvent(toolStartWithArgs("call-2", { pattern: "module" }));
 
-		expect(setWorkingMessage).toHaveBeenCalledTimes(1);
-		expect(setWorkingMessage.mock.calls[0]?.[0]).toContain("Editing module");
+		expect(indicator.setToolActivity).toHaveBeenCalledTimes(1);
+		expect(indicator.setToolActivity.mock.calls[0]?.[1]).toBe("Searching module");
 	});
 });
