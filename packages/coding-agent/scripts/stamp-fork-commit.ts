@@ -9,10 +9,11 @@
  * and the stamped source ship in the tarball.
  *
  * Hash resolution order:
- *   1. `jj log -r @` — the fork workflow's colocated jj working copy. Running
- *      `jj log` snapshots the working copy first, so `@` names exactly the
- *      tree being packed.
- *   2. `git rev-parse --short HEAD` — plain git clones.
+ *   1. `git rev-parse --short HEAD` — in the colocated jj+git fork, git HEAD
+ *      tracks the working copy's parent (`@-`), which for a parked tree is the
+ *      branch tip: a real, pushed commit that exists on GitHub.
+ *   2. `jj log -r @-` — non-colocated jj repos; `@-` avoids naming the empty
+ *      working-copy placeholder (a local, unpushed commit).
  *   3. `""` — no VCS (e.g. packing from an unpacked tarball); the version
  *      display stays identical to upstream.
  *
@@ -43,14 +44,11 @@ async function tryReadCommand(command: string[], cwd: string): Promise<string> {
 	return trimmed;
 }
 
-/** Resolve the short commit id of the tree being packed: jj working copy, git HEAD fallback, "" without a VCS. */
+/** Resolve the short commit id of the tree being packed: git HEAD (branch tip in colocated jj+git), jj parent fallback, "" without a VCS. */
 export async function resolveForkCommit(cwd: string = packageDir): Promise<string> {
-	const jj = await tryReadCommand(
-		["jj", "log", "-r", "@", "--no-graph", "-T", `commit_id.short(${HASH_LENGTH})`],
-		cwd,
-	);
-	if (jj) return jj;
-	return tryReadCommand(["git", "rev-parse", `--short=${HASH_LENGTH}`, "HEAD"], cwd);
+	const git = await tryReadCommand(["git", "rev-parse", `--short=${HASH_LENGTH}`, "HEAD"], cwd);
+	if (git) return git;
+	return tryReadCommand(["jj", "log", "-r", "@-", "--no-graph", "-T", `commit_id.short(${HASH_LENGTH})`], cwd);
 }
 
 /** Render the stamped module. Deterministic, so `--reset` restores the committed placeholder byte-for-byte. */

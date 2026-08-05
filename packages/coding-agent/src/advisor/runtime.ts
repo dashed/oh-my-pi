@@ -384,10 +384,6 @@ export class AdvisorRuntime {
 	 *  re-trigger the same error. */
 	#quotaExhausted = false;
 
-	/** Latched while the quarantine-halt notice is the active user-facing state,
-	 *  so repeated quarantines don't re-emit it. Re-arms on a clean turn. */
-	#quarantineNoticeActive = false;
-
 	constructor(
 		private readonly agent: AdvisorAgent,
 		private readonly host: AdvisorRuntimeHost,
@@ -1250,19 +1246,6 @@ function getAdvisorTurnError(messages: readonly AgentMessage[]): Error | undefin
 	if (messages.length === 0) return undefined;
 	if (messages.some(message => message.role === "assistant")) return undefined;
 	return new Error("Advisor turn ended without an assistant response");
-}
-
-/**
- * True when the turn's messages carry an `advise` tool call — the advisor
- * actually delivered advice, as opposed to a completed-but-silent review.
- */
-function messagesContainAdviseCall(messages: readonly AgentMessage[]): boolean {
-	return messages.some(
-		message =>
-			message.role === "assistant" &&
-			Array.isArray(message.content) &&
-			message.content.some(block => block.type === "toolCall" && block.name === "advise"),
-	);
 }
 
 type TextualContent = string | readonly (TextContent | ImageContent)[];
