@@ -881,6 +881,7 @@ export class SessionAdvisors {
 					advisorRef.adviseTool.beginUpdate(inProgress);
 					advisorRef.emissionGuard.beginUpdate();
 				},
+				grantedToolNames: () => advisorLoopTools.map(tool => tool.name),
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {

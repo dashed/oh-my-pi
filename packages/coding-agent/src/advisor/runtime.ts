@@ -128,12 +128,25 @@ const ADVISOR_OUTPUT_ONLY_HAZARDS: readonly AdvisorOutputHazard[] = [
 ];
 
 /**
- * Replaces an advisor assistant turn that requested unavailable tools or generated
- * output-only destructive directives with a sanitized error before dispatch.
+ * Sanitizes an advisor assistant turn before dispatch: strips tool calls the
+ * advisor was never granted, and replaces the whole turn with a sanitized error
+ * when nothing salvageable remains.
  *
  * The agent loop records assistant turns before dispatching tools. Without this
  * pre-dispatch rewrite, an advisor hallucination can leave unrelated text in the
  * advisor transcript even though the action itself never executes.
+ *
+ * Unavailable-tool handling is advise-preserving: an ungranted tool call can
+ * never execute (`resolveToolForCall` returns undefined for it), so when the
+ * same turn carries a valid granted `advise` call, only the unauthorized blocks
+ * are stripped and the turn proceeds — the advice is still delivered and the
+ * model learns nothing from a discarded turn it cannot see. Reasoning models
+ * that leak chat-template tool envelopes into their output (e.g. deepseek DSML
+ * markup healed into toolCall blocks upstream) hit this path on every turn;
+ * whole-turn quarantining them burned two model calls per primary turn while
+ * delivering zero advice. Whole-turn quarantine is reserved for turns with no
+ * safe in-band equivalent: unavailable tool calls WITHOUT valid advise, and
+ * output-only destructive directives.
  */
 export function quarantineAdvisorUnsafeOutput(
 	message: AssistantMessage,
@@ -143,6 +156,7 @@ export function quarantineAdvisorUnsafeOutput(
 	const reasons: string[] = [];
 	const unavailableToolNames = new Set<string>();
 	const generatedParts: string[] = [];
+	let hasValidAdvise = false;
 	for (const block of message.content) {
 		// Cursor exec-channel native blocks (bash/read/grep/...) are stamped
 		// kCursorExecResolved: they already ran server-side through the
@@ -158,15 +172,35 @@ export function quarantineAdvisorUnsafeOutput(
 		) {
 			unavailableToolNames.add(block.name);
 		}
-		if (block.type === "toolCall" && block.name === "advise" && typeof block.arguments.note === "string") {
+		if (
+			block.type === "toolCall" &&
+			block.name === "advise" &&
+			availableToolNames.has("advise") &&
+			typeof block.arguments.note === "string"
+		) {
+			hasValidAdvise = true;
 			generatedParts.push(block.arguments.note);
 		}
 		if (block.type === "text") generatedParts.push(block.text);
 	}
 	if (unavailableToolNames.size > 0) {
-		const names = [...unavailableToolNames].sort();
-		const toolLabel = names.length === 1 ? "tool" : "tools";
-		reasons.push(`requested unavailable ${toolLabel} ${names.join(", ")}`);
+		if (hasValidAdvise) {
+			// Strip only the unauthorized blocks; the granted advise call (and any
+			// text) stays and dispatches normally. The advise call always survives
+			// stripping, so a "toolUse" stop still has a call to dispatch.
+			message.content = message.content.filter(
+				block =>
+					!(
+						block.type === "toolCall" &&
+						unavailableToolNames.has(block.name) &&
+						(block as CursorExecResolvedCarrier)[kCursorExecResolved] !== true
+					),
+			);
+		} else {
+			const names = [...unavailableToolNames].sort();
+			const toolLabel = names.length === 1 ? "tool" : "tools";
+			reasons.push(`requested unavailable ${toolLabel} ${names.join(", ")}`);
+		}
 	}
 
 	const generatedText = generatedParts.join("\n");
@@ -228,13 +262,40 @@ export function buildAdvisorQuarantineSourceText(currentInput: string, messages:
 const MAX_COALESCE_ROUNDS = 3;
 
 /**
- * Consecutive quarantined advisor turns tolerated before the failure is surfaced
- * to the host UI. A quarantine discards the advisor's whole turn before dispatch,
- * so its advice never reaches the primary; one silent re-prime is allowed to
- * recover a one-off hallucination, but a persistent quarantine loop is a real
- * supervision gap the user must see (issue #6661). Reset on any successful turn.
+ * Consecutive quarantined advisor turns tolerated before the runtime latches off
+ * for the session. A quarantine discards the advisor's whole turn before dispatch,
+ * so its advice never reaches the primary; the first quarantine earns ONE automatic
+ * retry whose batch carries a tightened tooling-constraint instruction
+ * ({@link buildAdvisorQuarantineRetryInstruction}), and a second consecutive
+ * quarantine proves the model cannot stay within its granted toolset — the runtime
+ * halts instead of burning two model calls per primary turn forever (issue #6661).
+ * Reset on any successful turn or explicit {@link AdvisorRuntime.reset}.
  */
 const MAX_QUARANTINE_RETRIES = 2;
+
+/**
+ * One-shot instruction appended to the automatic quarantine-retry batch. Names the
+ * advisor's granted toolset explicitly because the quarantined model demonstrably
+ * emits tool-call syntax for tools it does not have (chat-template envelope leaks,
+ * hallucinated capabilities); a bare re-prime repeats the same violation.
+ */
+function buildAdvisorQuarantineRetryInstruction(grantedToolNames: readonly string[] | undefined): string {
+	const constraint = grantedToolNames?.length
+		? `You only have these tools: ${grantedToolNames.join(", ")}. Never emit tool-call syntax for any other tool.`
+		: "Never emit tool-call syntax for any tool outside your granted toolset.";
+	return `\n\n[ADVISOR TOOLING CONSTRAINT — one-shot] ${constraint} Deliver advice only through the advise tool.`;
+}
+
+/** Whether the turn's messages contain a call to the granted `advise` tool. */
+function messagesContainAdviseCall(messages: readonly AgentMessage[]): boolean {
+	return messages.some(
+		message =>
+			message.role === "assistant" &&
+			message.content.some(
+				block => block.type === "toolCall" && block.name === "advise" && typeof block.arguments.note === "string",
+			),
+	);
+}
 
 const ADVISOR_RENDER_OPTIONS = {
 	includeToolIntent: true,
@@ -299,6 +360,15 @@ export class AdvisorRuntime {
 	#backlog = 0;
 	#consecutiveFailures = 0;
 	#failureNotified = false;
+	/**
+	 * True while the outstanding failure notice came from the quarantine halt.
+	 * Such a notice re-arms ONLY on explicit reset/seed or when the advisor
+	 * actually delivers advice — never on a silent/advice-less success — so one
+	 * persistently-quarantining model warns once per session instead of
+	 * re-warning after every quiet turn. Notices from other failure paths keep
+	 * the legacy re-arm-on-any-success behavior.
+	 */
+	#quarantineNoticeActive = false;
 	/** Consecutive quarantined turns since the last success/reset (issue #6661). */
 	#consecutiveQuarantines = 0;
 	/** Whether primary reasoning is included in advisor deltas for the current model. */
@@ -449,6 +519,7 @@ export class AdvisorRuntime {
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
 		this.#failureNotified = false;
+		this.#quarantineNoticeActive = false;
 		this.#advisorRegexSecretValues.clear();
 		this.#wakeAllWaiters();
 		try {
@@ -547,6 +618,7 @@ export class AdvisorRuntime {
 		this.#droppedBacklogs = 0;
 		this.#consecutiveQuarantines = 0;
 		this.#failureNotified = false;
+		this.#quarantineNoticeActive = false;
 		this.#resetAdvisorContext(true, true);
 	}
 
@@ -568,6 +640,7 @@ export class AdvisorRuntime {
 		this.#failing = false;
 		this.#droppedBacklogs = 0;
 		this.#failureNotified = false;
+		this.#quarantineNoticeActive = false;
 		this.#clearSeenContext();
 		this.#wakeAllWaiters();
 	}
@@ -938,7 +1011,17 @@ export class AdvisorRuntime {
 					success = true;
 					this.#failing = false;
 					this.#consecutiveFailures = 0;
-					this.#failureNotified = false;
+					// A quarantine-halt notice re-arms only when the advisor actually
+					// delivers advice (or on explicit reset) — a silent/advice-less
+					// success must not re-arm it. Other failure notices keep the
+					// legacy re-arm-on-any-success behavior.
+					if (
+						!this.#quarantineNoticeActive ||
+						messagesContainAdviseCall(this.agent.state.messages.slice(messageSnapshot))
+					) {
+						this.#failureNotified = false;
+						this.#quarantineNoticeActive = false;
+					}
 					this.#droppedBacklogs = 0;
 					this.#consecutiveQuarantines = 0;
 					if (this.host.onTurnSuccess) {
@@ -1022,23 +1105,38 @@ export class AdvisorRuntime {
 					}
 					if (err instanceof AdvisorOutputQuarantinedError) {
 						// A quarantine discards the advisor's whole turn before dispatch, so
-						// its advice never reaches the primary. One re-prime is allowed to
-						// recover a one-off hallucination silently; a persistent quarantine
-						// loop is a supervision gap the user must see in the main UI — not an
-						// unbounded silent retry. Surface it (deduped by #notifyFailureOnce)
-						// and drop the batch to break the loop (issue #6661).
+						// its advice never reaches the primary. The first quarantine earns
+						// ONE automatic retry whose batch carries a tightened instruction
+						// naming the granted toolset — a bare re-prime just repeats the
+						// violation. A second consecutive quarantine proves the model
+						// cannot stay within its granted toolset: latch the runtime OFF
+						// for the session (cleared only by explicit reset) and surface ONE
+						// deduped notice, instead of burning two model calls per primary
+						// turn for zero delivered advice (issue #6661).
 						this.#consecutiveQuarantines++;
 						if (this.#consecutiveQuarantines >= MAX_QUARANTINE_RETRIES) {
 							this.#notifyFailureOnce(err);
+							this.#quarantineNoticeActive = true;
 							this.#consecutiveQuarantines = 0;
-							this.#resetAdvisorContext(true, true);
+							this.#halted = true;
+							this.#pending = [];
+							this.#backlog = 0;
+							this.#wakeAllWaiters();
+							this.#notifyWaiters();
+							logger.warn(
+								"advisor halted after repeated output quarantines; use /advisor or reload config to re-enable",
+								{ err: String(err) },
+							);
 							continue;
 						}
-						const rePrime = this.#pending.length > 0 ? this.#latestMessages : undefined;
-						// Wake catchup waiters only when nothing is re-primed; otherwise the
-						// re-primed turn restores the backlog and waiters resolve on its completion.
-						this.#resetAdvisorContext(true, !rePrime);
-						if (rePrime) this.onTurnEnd(rePrime);
+						this.#pending.unshift({
+							text: batch + buildAdvisorQuarantineRetryInstruction(this.host.grantedToolNames?.()),
+							rawMessages,
+							renderRevision: this.#renderRevision,
+							turns: finalTurns,
+							wip,
+							overflowRecovery: recoveringOverflow || undefined,
+						});
 						continue;
 					}
 					// Epoch guard after the async error hook.
