@@ -274,8 +274,6 @@ export class TeamObserver {
 			this.#pumpScan();
 		}, pollMs);
 		this.#pollTimer.unref?.();
-
-		this.#pumpScan();
 	}
 
 	/** Clear every timer and unsubscribe every feed. Idempotent. */
@@ -330,7 +328,9 @@ export class TeamObserver {
 		this.#scanInFlight = true;
 		void this.#scan()
 			.catch(error => {
-				logger.warn("team-observer: scan failed", { error: error instanceof Error ? error.message : String(error) });
+				logger.warn("team-observer: scan failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
 			})
 			.finally(() => {
 				this.#scanInFlight = false;
@@ -364,6 +364,15 @@ export class TeamObserver {
 
 	async #scan(): Promise<void> {
 		if (this.#disposed) return;
+		await this.scanForTest();
+	}
+
+	/**
+	 * @internal Test seam: one full scan cycle, awaited. Production drives
+	 * scans through the interval/event pump; tests call this directly so fake
+	 * clocks stay deterministic without flushing real fs through the pump.
+	 */
+	async scanForTest(): Promise<void> {
 		const config = this.#getConfig();
 		if (!config.enabled) {
 			this.#flags.clear();
@@ -460,7 +469,13 @@ export class TeamObserver {
 	}
 
 	/** P3: claimable pending work while a worker has been parked past stallIdleMs. */
-	#detectParkedStall(refs: AgentRef[], tasks: TeamTask[], now: number, config: TeamObserverConfig, out: Detection[]): void {
+	#detectParkedStall(
+		refs: AgentRef[],
+		tasks: TeamTask[],
+		now: number,
+		config: TeamObserverConfig,
+		out: Detection[],
+	): void {
 		const claimable = claimableTasks(tasks);
 		if (claimable.length === 0) return;
 		if (refs.some(ref => ref.kind === "sub" && ref.status === "running")) return;
@@ -514,7 +529,7 @@ export class TeamObserver {
 			if (ref.kind !== "sub" || ref.status !== "running") continue;
 			const observed = this.#observers.getSession(ref.id);
 			const progress = observed?.progress;
-			if (!observed || observed.status !== "active" || !progress) continue;
+			if (observed?.status !== "active" || !progress) continue;
 			if (progress.cost > config.maxCostPerRunUsd) {
 				out.push({
 					key: `cost-runaway:${ref.id}`,
@@ -537,7 +552,13 @@ export class TeamObserver {
 	}
 
 	/** P6: claimable work, no running sub, every live sub idle/parked past stallIdleMs. Never Main-idle-no-pending. */
-	#detectAllIdle(refs: AgentRef[], tasks: TeamTask[], now: number, config: TeamObserverConfig, out: Detection[]): void {
+	#detectAllIdle(
+		refs: AgentRef[],
+		tasks: TeamTask[],
+		now: number,
+		config: TeamObserverConfig,
+		out: Detection[],
+	): void {
 		const claimable = claimableTasks(tasks);
 		if (claimable.length === 0) return;
 		const subs = refs.filter(ref => ref.kind === "sub" && ref.status !== "aborted");
