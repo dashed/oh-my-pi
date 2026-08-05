@@ -298,4 +298,11 @@ describe("mergeOpenRouterRouting", () => {
 			),
 		).toEqual({ only: ["anthropic"], order: ["anthropic", "openai"], ignore: ["deepinfra"], sort: "latency" });
 	});
+
+	it("never forwards override-side empty arrays to the wire, even without a compat routing", () => {
+		// `{ only: [] }` would serialize as an allowlist of zero providers.
+		expect(mergeOpenRouterRouting({ only: [] }, undefined)).toEqual({});
+		expect(mergeOpenRouterRouting({ only: [], order: [], sort: "price" }, undefined)).toEqual({ sort: "price" });
+		expect(mergeOpenRouterRouting({ only: [] }, { order: ["anthropic"] })).toEqual({ order: ["anthropic"] });
+	});
 });

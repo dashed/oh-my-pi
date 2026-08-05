@@ -771,6 +771,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				await runProviderCommand(command.args, {
 					settings: runtime.ctx.session.settings,
 					session: runtime.ctx.session,
+					onUnignore: slug => runtime.ctx.eventController.resetProviderHealthNotice(slug),
 				}),
 			);
 			runtime.ctx.editor.setText("");

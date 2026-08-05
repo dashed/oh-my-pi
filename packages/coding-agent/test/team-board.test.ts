@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
-import { TempDir } from "@oh-my-pi/pi-utils";
-import { LOCK_STALE_MS, TeamBoard, type TeamBoardOutcome, withTaskLock } from "../src/teams/board";
+import { getConfigDirName, getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { MAIN_AGENT_ID } from "../src/registry/agent-registry";
+import { LOCK_STALE_MS, resolveTeamBoardDir, TeamBoard, type TeamBoardOutcome, withTaskLock } from "../src/teams/board";
 
 let temp: TempDir;
 let board: TeamBoard;
@@ -57,7 +59,7 @@ describe("blockedBy gating", () => {
 		}
 
 		expectOk(await board.claim(predId, "agent-b"));
-		expectOk(await board.complete(predId));
+		expectOk(await board.complete(predId, undefined, "agent-b"));
 
 		// Completion cleared the dependency from the dependent's persisted file.
 		const stored = await board.list();
@@ -69,7 +71,7 @@ describe("blockedBy gating", () => {
 	it("blockedBy on an already-done task does not gate the claim", async () => {
 		const predId = await createTask("done-first");
 		expectOk(await board.claim(predId, "agent-b"));
-		expectOk(await board.complete(predId));
+		expectOk(await board.complete(predId, undefined, "agent-b"));
 
 		// Created after the predecessor finished: its blockedBy entry is never
 		// cleared by a completion, so the claim gate must honor dep status.
@@ -93,7 +95,7 @@ describe("release", () => {
 		const taskId = await createTask("handoff");
 		expectOk(await board.claim(taskId, "agent-a"));
 
-		expectOk(await board.release(taskId));
+		expectOk(await board.release(taskId, "agent-a"));
 		const stored = (await board.list())[0]!;
 		expect(stored.status).toBe("pending");
 		expect(stored.claimedBy).toBeUndefined();
@@ -105,7 +107,7 @@ describe("release", () => {
 
 	it("rejects releasing a task that is not claimed", async () => {
 		const taskId = await createTask("pending-task");
-		const outcome = await board.release(taskId);
+		const outcome = await board.release(taskId, "agent-a");
 		expect(outcome.ok).toBe(false);
 		if (!outcome.ok) expect(outcome.code).toBe("invalid_state");
 	});
@@ -122,7 +124,7 @@ describe("persistence", () => {
 		});
 		expectOk(described);
 		expectOk(await board.claim(predId, "agent-a"));
-		expectOk(await board.complete(predId, "shipped"));
+		expectOk(await board.complete(predId, "shipped", "agent-a"));
 
 		const reloaded = new TeamBoard(temp.join("tasks"));
 		const tasks = await reloaded.list();
@@ -208,7 +210,7 @@ describe("on-disk trust", () => {
 			description: "desc \x1b]52;c;PGFjZT4=\x07",
 			status: "claimed",
 			claimedBy: "agent-\x07evil",
-			blockedBy: [],
+			blockedBy: ["ok-dep", "evil\x1b[2J-dep", "osc \x1b]52;c;PGFjZT4=\x07"],
 			result: "done \x1b[31m",
 			createdBy: "test",
 			createdAt: Date.now(),
@@ -220,6 +222,9 @@ describe("on-disk trust", () => {
 		expect(task.description).toBe("desc");
 		expect(task.claimedBy).toBe("agent-evil");
 		expect(task.result).toBe("done");
+		// blockedBy is untrusted on-disk text too: it flows into `team list`
+		// and claim-blocked failure output verbatim.
+		expect(task.blockedBy).toEqual(["ok-dep", "evil-dep", "osc"]);
 	});
 });
 
@@ -230,5 +235,69 @@ describe("storage permissions", () => {
 		expect(dirStat.mode & 0o777).toBe(0o700);
 		const fileStat = await fs.stat(path.join(temp.join("tasks"), `${taskId}.json`));
 		expect(fileStat.mode & 0o777).toBe(0o600);
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"repairs intermediate teams/<id> dirs to 0700 under the config root",
+		async () => {
+			const home = await TempDir.create("omp-board-home-");
+			const previousConfigDir = Bun.env.PI_CONFIG_DIR;
+			const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+			try {
+				// Point the config root under the temp dir via the supported
+				// PI_CONFIG_DIR override, then force a fresh DirResolver.
+				Bun.env.PI_CONFIG_DIR = path.relative(os.homedir(), `${home.absolute()}/cfg`);
+				setAgentDir(home.join("agent"));
+				const rooted = new TeamBoard(resolveTeamBoardDir("team-xyz"));
+				const created = await rooted.create({ title: "x", createdBy: "test" });
+				if (!created.ok) throw new Error(created.message);
+
+				const root = getConfigRootDir();
+				expect(root.startsWith(home.absolute())).toBe(true);
+				for (const dir of [
+					path.join(root, "teams"),
+					path.join(root, "teams", "team-xyz"),
+					path.join(root, "teams", "team-xyz", "tasks"),
+				]) {
+					expect((await fs.stat(dir)).mode & 0o777).toBe(0o700);
+				}
+			} finally {
+				if (previousConfigDir === undefined) delete Bun.env.PI_CONFIG_DIR;
+				else Bun.env.PI_CONFIG_DIR = previousConfigDir;
+				// Re-resolve under the real config root: the explicit override
+				// when one was set, else the default <configRoot>/agent.
+				setAgentDir(previousAgentDir ?? path.join(os.homedir(), getConfigDirName(), "agent"));
+				await home.remove();
+			}
+		},
+	);
+});
+
+describe("claim ownership", () => {
+	it("rejects complete/release by a non-owner; the owner and Main succeed", async () => {
+		const taskId = await createTask("owned");
+		expectOk(await board.claim(taskId, "agent-a"));
+
+		const completeByPeer = await board.complete(taskId, "stolen", "agent-b");
+		expect(completeByPeer.ok).toBe(false);
+		if (!completeByPeer.ok) expect(completeByPeer.code).toBe("not_owner");
+
+		const releaseByPeer = await board.release(taskId, "agent-b");
+		expect(releaseByPeer.ok).toBe(false);
+		if (!releaseByPeer.ok) expect(releaseByPeer.code).toBe("not_owner");
+
+		// The failed takeovers left the claim untouched.
+		const stored = (await board.list())[0]!;
+		expect(stored.status).toBe("claimed");
+		expect(stored.claimedBy).toBe("agent-a");
+
+		// The main agent operates the board for recovery (e.g. dead-owner release).
+		expectOk(await board.release(taskId, MAIN_AGENT_ID));
+		expect((await board.list())[0]!.status).toBe("pending");
+
+		// The regular owner path still works.
+		expectOk(await board.claim(taskId, "agent-a"));
+		expectOk(await board.complete(taskId, "done", "agent-a"));
+		expect((await board.list())[0]!.status).toBe("done");
 	});
 });

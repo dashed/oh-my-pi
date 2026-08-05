@@ -177,6 +177,23 @@ export class InputController {
 	#focusedPasteListenerInstalled = false;
 	#btwBranchListenerInstalled = false;
 	#btwCopyListenerInstalled = false;
+	/** Whether the alt+↓/ctrl+↓ agent-panel chords are currently registered. */
+	#agentPanelChordsEnabled: boolean | undefined;
+
+	/**
+	 * Register the agent-panel focus chords only while the panel lists live
+	 * subagents: a matched editor custom key is always consumed, so leaving
+	 * the handlers registered while the panel is empty would swallow
+	 * alt+↓/ctrl+↓ for nothing. Called by InteractiveMode's panel sync.
+	 */
+	setAgentPanelFocusChordsEnabled(enabled: boolean): void {
+		if (this.#agentPanelChordsEnabled === enabled) return;
+		this.#agentPanelChordsEnabled = enabled;
+		for (const key of ["alt+down", "ctrl+down"] as const) {
+			if (enabled) this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.focusAgentPanel());
+			else this.ctx.editor.removeCustomKeyHandler(key);
+		}
+	}
 	// Tap counter for the double-← gesture; reset whenever a quiet gap
 	// (>= LEFT_DOUBLE_TAP_MAX_GAP_MS) starts a fresh sequence. See
 	// #detectLeftDoubleTap.
@@ -519,11 +536,11 @@ export class InputController {
 		// Agent panel entry: alt+↓ (primary) / ctrl+↓ (backup) drop keyboard focus
 		// into the anchored subagent panel below the editor. A dedicated chord —
 		// never Down-past-last-line, which would fight the editor's own cursor /
-		// history navigation — and plain typing/arrow keys are never eaten. Inert
-		// while the panel has no live subagents (focusAgentPanel no-ops).
-		for (const key of ["alt+down", "ctrl+down"] as const) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.focusAgentPanel());
-		}
+		// history navigation — and plain typing/arrow keys are never eaten. The
+		// chords are registered ONLY while the panel lists live subagents: a
+		// matched custom key is always consumed, so an inert focusAgentPanel
+		// would swallow the keypress for nothing.
+		this.setAgentPanelFocusChordsEnabled(false);
 
 		// Double-tap left arrow on an empty editor: opens the agent hub from the
 		// main session, or returns the focused subagent view to the main session.

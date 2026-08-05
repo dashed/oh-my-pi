@@ -662,12 +662,19 @@ export function mergeOpenRouterRouting(
 	compatRouting: OpenRouterRouting | undefined,
 ): OpenRouterRouting | undefined {
 	if (!override) return compatRouting;
-	if (!compatRouting) return override;
-	const merged: OpenRouterRouting = { ...override };
-	if (compatRouting.only?.length) merged.only = compatRouting.only;
-	if (compatRouting.order?.length) merged.order = compatRouting.order;
-	if (compatRouting.ignore?.length) merged.ignore = compatRouting.ignore;
-	if (compatRouting.sort) merged.sort = compatRouting.sort;
+	if (!override) return compatRouting;
+	// Field-by-field: an empty array is not a preference, so it never wins
+	// from EITHER side — `{ ...override }` would forward `only: []` to the
+	// wire as an allowlist of zero providers.
+	const merged: OpenRouterRouting = {};
+	const only = compatRouting?.only?.length ? compatRouting.only : override.only;
+	if (only?.length) merged.only = only;
+	const order = compatRouting?.order?.length ? compatRouting.order : override.order;
+	if (order?.length) merged.order = order;
+	const ignore = compatRouting?.ignore?.length ? compatRouting.ignore : override.ignore;
+	if (ignore?.length) merged.ignore = ignore;
+	const sort = compatRouting?.sort ?? override.sort;
+	if (sort) merged.sort = sort;
 	return merged;
 }
 

@@ -224,15 +224,31 @@ export async function completeEnsemble(
 	const externalSignal = options.signal;
 
 	// Internal cancellation: post-quorum/post-timeout member teardown. External
-	// aborts forward here so pending members die with the caller.
+	// aborts forward here so pending members die with the caller; the forwarder
+	// is removed on settle so session-lifecycle signals do not accumulate one
+	// controller closure per ensemble call.
 	const controller = new AbortController();
-	if (externalSignal !== undefined) {
+	const forwardExternalAbort = externalSignal
+		? () => {
+				controller.abort(externalSignal.reason);
+			}
+		: undefined;
+	if (externalSignal !== undefined && forwardExternalAbort !== undefined) {
 		if (externalSignal.aborted) {
 			controller.abort(externalSignal.reason);
 		} else {
-			externalSignal.addEventListener("abort", () => controller.abort(externalSignal.reason), { once: true });
+			externalSignal.addEventListener("abort", forwardExternalAbort, { once: true });
 		}
 	}
+	// Once the member phase settles (quorum or timeout) the controller is
+	// aborted anyway and the forwarder is dead weight — detach so a
+	// session-lifecycle external signal does not retain one controller
+	// closure per ensemble call.
+	const detachExternalAbort = (): void => {
+		if (externalSignal !== undefined && forwardExternalAbort !== undefined) {
+			externalSignal.removeEventListener("abort", forwardExternalAbort);
+		}
+	};
 
 	const memberOptions = buildMemberOptions(request.model, request.options, controller.signal);
 	const arrivals: MemberArrival[] = [];
@@ -279,8 +295,9 @@ export async function completeEnsemble(
 	}
 
 	if (arrivals.length >= quorum) {
-		// Grace window for stragglers, then cancel whatever is still pending.
-		if (settledCount < members && graceMs > 0) {
+		// Grace window for stragglers, then cancel whatever is still pending. A
+		// caller that already aborted is not listening — skip the wait.
+		if (!externalSignal?.aborted && settledCount < members && graceMs > 0) {
 			const graceDeadline = Date.now() + graceMs;
 			while (settledCount < members) {
 				const remaining = graceDeadline - Date.now();
@@ -289,6 +306,7 @@ export async function completeEnsemble(
 			}
 		}
 		controller.abort("swarm: quorum reached");
+		detachExternalAbort();
 		logger.debug("swarm: quorum reached", {
 			members,
 			quorum,
@@ -296,14 +314,17 @@ export async function completeEnsemble(
 			settled: settledCount,
 			synthesize: options.synthesize,
 		});
+		// An abort that landed after quorum must still cancel the run: returning
+		// a result here would silently apply a vote the caller already walked
+		// away from.
+		if (externalSignal?.aborted) throw ensembleAbortError(externalSignal);
 		return options.synthesize === "merge"
-			? synthesizeMerge(request, memberOptions, externalSignal, arrivals, options.recordUsage)
+			? synthesizeMerge(request, memberOptions, timeoutMs, externalSignal, arrivals, options.recordUsage)
 			: voteArrivals(arrivals);
 	}
 
 	// Timeout (or total member failure) before quorum: cancel stragglers and run
-	// ONE direct full-strength fallback with identical options, wired only to the
-	// caller's signal.
+	// ONE direct full-strength fallback with identical options.
 	controller.abort("swarm: quorum timeout");
 	logger.debug("swarm: quorum not reached; running direct fallback", {
 		members,
@@ -311,12 +332,21 @@ export async function completeEnsemble(
 		arrived: arrivals.length,
 		settled: settledCount,
 	});
-	const fallback = await completeSimple(request.model, request.context, {
-		...memberOptions,
-		signal: externalSignal,
-	});
-	options.recordUsage?.(fallback);
-	return fallback;
+	// The fallback phase is bounded by a second timeoutMs (the budget
+	// swarmCallerBudgetMs advertises) so a stalled provider cannot hang a
+	// signal-less caller (mnemopi) indefinitely.
+	const fallbackPhase = createPhaseSignal(timeoutMs, externalSignal);
+	try {
+		const fallback = await completeSimple(request.model, request.context, {
+			...memberOptions,
+			signal: fallbackPhase.signal,
+		});
+		options.recordUsage?.(fallback);
+		return fallback;
+	} finally {
+		detachExternalAbort();
+		fallbackPhase.dispose();
+	}
 }
 
 /**
@@ -344,15 +374,62 @@ function voteArrivals(arrivals: MemberArrival[]): AssistantMessage {
 	return (winner ?? arrivals)[0].message;
 }
 
+/** AbortError honoring the caller's abort reason when it carries one. */
+function ensembleAbortError(externalSignal: AbortSignal): Error {
+	const reason: unknown = externalSignal.reason;
+	if (reason instanceof Error) return reason;
+	return new DOMException(typeof reason === "string" ? reason : "swarm: aborted by caller", "AbortError");
+}
+
+/**
+ * Cancellation scope for one post-member phase (fallback or merge
+ * synthesizer): an internal deadline at `timeoutMs` (the second timeoutMs in
+ * the {@link swarmCallerBudgetMs} budget) plus external-abort forwarding.
+ * `dispose` clears the timer and detaches the forwarder.
+ */
+function createPhaseSignal(
+	timeoutMs: number,
+	externalSignal: AbortSignal | undefined,
+): { signal: AbortSignal; dispose: () => void } {
+	const controller = new AbortController();
+	const timer = setTimeout(() => {
+		controller.abort(new DOMException(`swarm: fallback phase exceeded ${timeoutMs}ms`, "TimeoutError"));
+	}, timeoutMs);
+	// Never keep a process alive for a swarm deadline.
+	timer.unref?.();
+	const forward = externalSignal
+		? () => {
+				controller.abort(externalSignal.reason);
+			}
+		: undefined;
+	if (externalSignal !== undefined && forward !== undefined) {
+		if (externalSignal.aborted) controller.abort(externalSignal.reason);
+		else externalSignal.addEventListener("abort", forward, { once: true });
+	}
+	return {
+		signal: controller.signal,
+		dispose: () => {
+			clearTimeout(timer);
+			if (externalSignal !== undefined && forward !== undefined) {
+				externalSignal.removeEventListener("abort", forward);
+			}
+		},
+	};
+}
+
 /**
  * Merge synthesis: one full-strength call (reasoning on, uncapped) on the
  * original context plus the candidate answers and a short-output instruction.
  * Any synthesizer failure — error/empty output or a thrown call — falls back
- * to the earliest member answer.
+ * to the earliest member answer, EXCEPT external cancellation, which always
+ * propagates (returning a stale member answer after the caller walked away
+ * would silently apply it). The call is bounded by an internal `timeoutMs`
+ * deadline so a signal-less caller cannot hang on a stalled provider.
  */
 async function synthesizeMerge(
 	request: EnsembleRequest,
 	memberOptions: SimpleStreamOptions,
+	timeoutMs: number,
 	externalSignal: AbortSignal | undefined,
 	arrivals: MemberArrival[],
 	recordUsage: ((message: AssistantMessage) => void) | undefined,
@@ -370,16 +447,21 @@ async function synthesizeMerge(
 			},
 		],
 	};
+	const phase = createPhaseSignal(timeoutMs, externalSignal);
 	try {
-		const synth = await completeSimple(request.model, synthContext, { ...memberOptions, signal: externalSignal });
+		const synth = await completeSimple(request.model, synthContext, { ...memberOptions, signal: phase.signal });
 		recordUsage?.(synth);
+		if (externalSignal?.aborted) throw ensembleAbortError(externalSignal);
 		if (ensembleText(synth) === undefined) return earliest;
 		return synth;
 	} catch (error) {
+		if (externalSignal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
 		logger.debug("swarm: merge synthesizer failed; using earliest member answer", {
 			error: error instanceof Error ? error.message : String(error),
 		});
 		return earliest;
+	} finally {
+		phase.dispose();
 	}
 }
 

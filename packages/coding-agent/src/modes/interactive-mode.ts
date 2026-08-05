@@ -2332,6 +2332,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			.list()
 			.filter(ref => ref.kind === "sub" && (ref.status === "running" || ref.status === "idle"));
 		const visible = live.length > 0 || this.#hasRunningSubagentSessions();
+		// The alt+↓/ctrl+↓ focus chords are registered only while the panel is
+		// visible — a matched editor custom key is always consumed, so an inert
+		// chord would swallow the keypress for nothing.
+		this.#inputController.setAgentPanelFocusChordsEnabled(visible);
 		this.#agentPanel.setAgents(live);
 		if (!visible) {
 			if (this.agentPanelContainer.children.length === 0) return;

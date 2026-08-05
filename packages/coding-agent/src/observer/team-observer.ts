@@ -132,6 +132,8 @@ interface ActiveFlag extends Detection {
 	lastNoticedAt: number;
 	noticeCount: number;
 	escalated: boolean;
+	/** Consecutive scans where the pathology was absent (flap dampening). */
+	missedScans: number;
 }
 
 // =============================================================================
@@ -142,6 +144,12 @@ interface ActiveFlag extends Detection {
 const OBSERVER_SENDER_ID = "Observer";
 /** L1 re-notice cadence per flag while a pathology persists (also the P4 re-flag window). */
 const NOTICE_WINDOW_MS = 300_000;
+/**
+ * Consecutive absent scans a flag survives before its ladder state resets.
+ * Without the grace, a flapping pathology (parked↔idle oscillation, retry
+ * toggles) re-fires the L1 notice and re-sends the L2 DM on every flap.
+ */
+const FLAP_GRACE_SCANS = 2;
 /** P7 grace: a freshly registered sub's parent may register moments later. */
 const ORPHAN_GRACE_MS = 10_000;
 /** Debounce for event-driven scans (progress itself is not a trigger). */
@@ -566,18 +574,25 @@ export class TeamObserver {
 		if (subs.some(ref => ref.status === "running")) return;
 		if (subs.some(ref => now - ref.lastActivity < config.stallIdleMs)) return;
 		const task = claimable[0]!;
-		// Nudge the most recently active worker: prefer a live idle one (cheap wake) over parked (revival).
+		// Nudge the most recently active worker: prefer a live idle one (cheap
+		// wake) over parked (revival). When NO idle worker exists the target is
+		// parked, and P3 already DM'd every parked worker individually this same
+		// scan — the board-level flag then carries no nudge of its own instead
+		// of double-DMing the same worker with a near-identical body.
 		const target = [...subs].sort(
 			(a, b) => (a.status === "idle" ? 0 : 1) - (b.status === "idle" ? 0 : 1) || b.lastActivity - a.lastActivity,
 		)[0]!;
+		const ownedByParkedStall = target.status === "parked";
 		out.push({
 			key: "all-idle:board",
 			pathology: "all-idle",
 			subjectId: "board",
 			summary: `team stalled — ${claimable.length} claimable task${claimable.length === 1 ? "" : "s"}, all ${subs.length} workers idle/parked`,
 			fix: `DM ${target.id} or claim "${task.title}" (${task.id}) yourself`,
-			nudgeTarget: target.id,
-			nudgeBody: `[team-observer] The team is stalled: ${claimable.length} claimable task${claimable.length === 1 ? "" : "s"} (e.g. "${task.title}" ${task.id}) and every worker is idle/parked. Run \`team list\` and claim one.`,
+			nudgeTarget: ownedByParkedStall ? undefined : target.id,
+			nudgeBody: ownedByParkedStall
+				? undefined
+				: `[team-observer] The team is stalled: ${claimable.length} claimable task${claimable.length === 1 ? "" : "s"} (e.g. "${task.title}" ${task.id}) and every worker is idle/parked. Run \`team list\` and claim one.`,
 		});
 	}
 
@@ -608,13 +623,21 @@ export class TeamObserver {
 			let flag = this.#flags.get(detection.key);
 			if (!flag) {
 				if (this.#flags.size >= MAX_TRACKED_FLAGS) continue;
-				flag = { ...detection, firstSeenAt: now, lastNoticedAt: 0, noticeCount: 0, escalated: false };
+				flag = {
+					...detection,
+					firstSeenAt: now,
+					lastNoticedAt: 0,
+					noticeCount: 0,
+					escalated: false,
+					missedScans: 0,
+				};
 				this.#flags.set(detection.key, flag);
 			} else {
 				flag.summary = detection.summary;
 				flag.fix = detection.fix;
 				flag.nudgeTarget = detection.nudgeTarget;
 				flag.nudgeBody = detection.nudgeBody;
+				flag.missedScans = 0;
 			}
 
 			if (now - flag.lastNoticedAt < NOTICE_WINDOW_MS) continue;
@@ -659,9 +682,14 @@ export class TeamObserver {
 			}
 		}
 
-		// Clear resolved flags (with a dim recovery notice when the user was told).
+		// Clear resolved flags (with a dim recovery notice when the user was
+		// told) — but only after FLAP_GRACE_SCANS consecutive absent scans, so a
+		// flapping pathology does not reset the ladder and re-fire the L1
+		// notice + L2 DM on every flap.
 		for (const [key, flag] of [...this.#flags]) {
 			if (seen.has(key)) continue;
+			flag.missedScans++;
+			if (flag.missedScans <= FLAP_GRACE_SCANS) continue;
 			this.#flags.delete(key);
 			this.#nudgedKeys.delete(key);
 			if (flag.noticeCount > 0) {

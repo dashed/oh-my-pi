@@ -135,6 +135,36 @@ describe("RoutingStatsTracker slow detection", () => {
 		recordTurns(tracker, "anthropic", 5, fastSample());
 		expect(tracker.isSlow("anthropic", THRESHOLDS)).toBe(false);
 	});
+
+	it("does not flag a single-sample ttft outlier (per-metric floor)", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		// 3 turns of healthy throughput, but exactly ONE reported a ttft — a
+		// one-sample "median" IS that sample and must not trip the notice.
+		tracker.record("anthropic", { tokensPerSecond: 100 });
+		tracker.record("anthropic", { tokensPerSecond: 100 });
+		tracker.record("anthropic", { tokensPerSecond: 100, ttftMs: 60_000 });
+		expect(tracker.isSlow("anthropic", THRESHOLDS)).toBe(false);
+		expect(tracker.slowReason("anthropic", THRESHOLDS)).toBeUndefined();
+	});
+
+	it("does not flag a single-sample tok/s outlier (per-metric floor)", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		// 3 turns with healthy ttft; exactly ONE reported a (slow) tok/s.
+		tracker.record("anthropic", { ttftMs: 300 });
+		tracker.record("anthropic", { ttftMs: 300 });
+		tracker.record("anthropic", { tokensPerSecond: 1, ttftMs: 300 });
+		expect(tracker.isSlow("anthropic", THRESHOLDS)).toBe(false);
+		expect(tracker.slowReason("anthropic", THRESHOLDS)).toBeUndefined();
+	});
+
+	it("flags once the outlier metric reaches two samples", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		tracker.record("anthropic", { tokensPerSecond: 100 });
+		tracker.record("anthropic", { tokensPerSecond: 100, ttftMs: 60_000 });
+		tracker.record("anthropic", { tokensPerSecond: 100, ttftMs: 60_000 });
+		expect(tracker.isSlow("anthropic", THRESHOLDS)).toBe(true);
+		expect(tracker.slowReason("anthropic", THRESHOLDS)).toBe("ttft p50 60.0s");
+	});
 });
 
 describe("RoutingStatsTracker persistence", () => {

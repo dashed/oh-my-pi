@@ -19,7 +19,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir, isEexist, isRecord, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
-import type { AgentRegistry } from "../registry/agent-registry";
+import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 
 // =============================================================================
 // Types
@@ -41,9 +41,16 @@ export interface TeamTask {
 	completedAt?: number;
 }
 
-export type TeamBoardErrorCode = "invalid_input" | "not_found" | "already_claimed" | "blocked" | "invalid_state" | "io";
+type TeamBoardErrorCode =
+	| "invalid_input"
+	| "not_found"
+	| "already_claimed"
+	| "blocked"
+	| "not_owner"
+	| "invalid_state"
+	| "io";
 
-export interface TeamBoardFailure {
+interface TeamBoardFailure {
 	ok: false;
 	code: TeamBoardErrorCode;
 	message: string;
@@ -53,7 +60,7 @@ export interface TeamBoardFailure {
 	pendingBlockers?: string[];
 }
 
-export interface TeamBoardSuccess {
+interface TeamBoardSuccess {
 	ok: true;
 	task: TeamTask;
 	/** Dependent task ids whose `blockedBy` was cleared by a completion. */
@@ -81,7 +88,7 @@ export function isValidTaskId(id: string): boolean {
 }
 
 /** Whether an unknown value is a persisted team task (`blockedBy` may be absent on disk). */
-export function isTeamTask(value: unknown): value is TeamTask {
+function isTeamTask(value: unknown): value is TeamTask {
 	if (!isRecord(value)) return false;
 	if (typeof value.id !== "string" || !isValidTaskId(value.id)) return false;
 	if (typeof value.title !== "string") return false;
@@ -219,8 +226,23 @@ const TASK_FILE_MODE = 0o600;
 
 async function ensureBoardDir(dir: string): Promise<void> {
 	await fs.mkdir(dir, { recursive: true, mode: BOARD_DIR_MODE });
-	// Defensive: recursive mkdir applies the mode only to leaf dirs it creates.
-	if (process.platform !== "win32") await fs.chmod(dir, BOARD_DIR_MODE).catch(() => {});
+	if (process.platform === "win32") return;
+	// Defensive: recursive mkdir applies the mode only to the leaf dirs it
+	// creates, so repair every component from the config root down — an
+	// intermediate `teams/` (or `<teamId>/`) left at the default umask would
+	// leak team/session directory names to same-machine users.
+	const root = getConfigRootDir();
+	const relative = path.relative(root, dir);
+	if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+		// Custom board dir outside the config root (tests): repair the leaf only.
+		await fs.chmod(dir, BOARD_DIR_MODE).catch(() => {});
+		return;
+	}
+	let current = root;
+	for (const segment of relative.split(path.sep)) {
+		current = path.join(current, segment);
+		await fs.chmod(current, BOARD_DIR_MODE).catch(() => {});
+	}
 }
 
 async function writeTaskAtomic(filePath: string, task: TeamTask): Promise<void> {
@@ -265,7 +287,9 @@ async function readTaskFile(filePath: string): Promise<TeamTask | null> {
 			description: value.description === undefined ? undefined : cleanStoredText(value.description, 4000),
 			claimedBy: value.claimedBy === undefined ? undefined : cleanStoredText(value.claimedBy, 200),
 			result: value.result === undefined ? undefined : cleanStoredText(value.result, 4000),
-			blockedBy: value.blockedBy ?? [],
+			// Blocker ids surface verbatim in `team list` and claim-blocked
+			// failures — same untrusted-text contract as every other field.
+			blockedBy: (value.blockedBy ?? []).map(id => cleanStoredText(id, 200)),
 		};
 	} catch {
 		logger.warn("team board: skipping corrupt task file", { filePath });
@@ -397,8 +421,10 @@ export class TeamBoard {
 	/**
 	 * Mark a claimed task done, then clear its id from every dependent's
 	 * `blockedBy` (each under its own lock) so they become claimable.
+	 * Only the claiming agent may complete a task — the main agent
+	 * ({@link MAIN_AGENT_ID}) acts as the board operator for recovery.
 	 */
-	async complete(taskId: string, result?: string): Promise<TeamBoardOutcome> {
+	async complete(taskId: string, result: string | undefined, actor: string): Promise<TeamBoardOutcome> {
 		if (!isValidTaskId(taskId)) return failure("invalid_input", `Invalid task id "${taskId}".`);
 		await ensureBoardDir(this.dir);
 		const filePath = this.#taskPath(taskId);
@@ -411,6 +437,13 @@ export class TeamBoard {
 					return failure(
 						"invalid_state",
 						`Task "${taskId}" is ${task.status}; only a claimed task can be completed.`,
+						{ task },
+					);
+				}
+				if (task.claimedBy !== actor && actor !== MAIN_AGENT_ID) {
+					return failure(
+						"not_owner",
+						`Task "${taskId}" is claimed by ${task.claimedBy ?? "another agent"}; only the claiming agent can complete it.`,
 						{ task },
 					);
 				}
@@ -447,8 +480,12 @@ export class TeamBoard {
 		return { ok: true, task: outcome.task, unblocked };
 	}
 
-	/** Return a claimed task to pending so another agent can claim it. */
-	async release(taskId: string): Promise<TeamBoardOutcome> {
+	/**
+	 * Return a claimed task to pending so another agent can claim it. Only the
+	 * claiming agent may release a task — the main agent ({@link MAIN_AGENT_ID})
+	 * acts as the board operator (e.g. releasing a dead agent's claim).
+	 */
+	async release(taskId: string, actor: string): Promise<TeamBoardOutcome> {
 		if (!isValidTaskId(taskId)) return failure("invalid_input", `Invalid task id "${taskId}".`);
 		await ensureBoardDir(this.dir);
 		const filePath = this.#taskPath(taskId);
@@ -460,6 +497,13 @@ export class TeamBoard {
 					return failure("invalid_state", `Task "${taskId}" is ${task.status}; not currently claimed.`, {
 						task,
 					});
+				}
+				if (task.claimedBy !== actor && actor !== MAIN_AGENT_ID) {
+					return failure(
+						"not_owner",
+						`Task "${taskId}" is claimed by ${task.claimedBy ?? "another agent"}; only the claiming agent can release it.`,
+						{ task },
+					);
 				}
 				task.status = "pending";
 				delete task.claimedBy;

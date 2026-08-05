@@ -8,6 +8,7 @@ import { afterEach, beforeAll, describe, expect, it, setSystemTime, vi } from "b
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
 import { AgentPanelComponent } from "@oh-my-pi/pi-coding-agent/modes/components/agent-panel";
+import { formatAgentRow } from "@oh-my-pi/pi-coding-agent/modes/components/agent-row";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -137,5 +138,31 @@ describe("shared agent row (hub ≡ panel)", () => {
 		} finally {
 			hub.dispose();
 		}
+	});
+
+	it("strips control bytes from the model-chosen task/description line", () => {
+		const agents = new AgentRegistry();
+		const ref = agents.register({ id: "Evil", displayName: "Evil", kind: "sub", session: {} as AgentSession });
+		// OSC 52 clipboard write + BEL, plus a CSI clear-screen — the same
+		// payload class the displayName/currentTool cells already block.
+		const observed = {
+			id: "Evil",
+			kind: "subagent",
+			label: "Subagent",
+			status: "active",
+			lastUpdate: 1,
+			progress: {
+				startedAtMs: 1,
+				currentTool: "bash",
+				cost: 0,
+				task: "pwn\x1b]52;c;PGFjZT4=\x07me\x1b[2J",
+			},
+		} as never;
+		const lines = formatAgentRow(ref, observed, false, 120, new IrcBus(agents));
+		const joined = lines.join("\n");
+		expect(joined).not.toContain("\x1b]52");
+		expect(joined).not.toContain("\x07");
+		expect(joined).not.toContain("\x1b[2J");
+		expect(Bun.stripANSI(joined)).toContain("pwnme");
 	});
 });

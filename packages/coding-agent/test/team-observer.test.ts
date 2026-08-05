@@ -281,8 +281,11 @@ describe("P1 stuck running agent", () => {
 		expect(harness.notifications).toHaveLength(1);
 		expect(harness.notifications[0]!.body).toContain("kill Worker");
 
-		// Clear on progress: fresh activity drops the flag (with a dim clear notice).
+		// Clear on progress: fresh activity drops the flag after the flap-grace
+		// scans (with a dim clear notice).
 		harness.setActivity("Worker", harness.clock.now);
+		await harness.poll();
+		await harness.poll();
 		await harness.poll();
 		expect(harness.flags()).toHaveLength(0);
 		expect(harness.statuses.some(s => s.includes("cleared") && s.includes("stuck"))).toBe(true);
@@ -334,8 +337,11 @@ describe("P2 error-looping agent", () => {
 		expect(harness.notifications[0]!.body).toContain("history://Flaky");
 		expect(harness.nudges).toHaveLength(0);
 
-		// Past the window the failures age out and the flag clears.
+		// Past the window the failures age out and the flag clears after the
+		// flap-grace scans.
 		harness.advance(ERROR_WINDOW_MS + 1);
+		await harness.poll();
+		await harness.poll();
 		await harness.poll();
 		expect(harness.flags()).toHaveLength(0);
 
@@ -365,12 +371,14 @@ describe("P3 parked worker with claimable work", () => {
 		await harness.start();
 
 		// Parked past stallIdleMs with claimable work → flag + immediate nudge.
-		// (The team-wide all-idle detector co-fires for a lone parked worker.)
+		// The team-wide all-idle detector co-fires for a lone parked worker but
+		// must NOT send a second DM: P3 owns the parked-worker nudge.
 		harness.advance(STALL_MS + 1);
 		await harness.poll();
 		expect(harness.flagKeys()).toContain("parked-stall:Sleeper");
 		const stallNudge = harness.nudges.find(n => n.body.includes("team list"));
 		expect(stallNudge?.to).toBe("Sleeper");
+		expect(harness.nudges.filter(n => n.to === "Sleeper")).toHaveLength(1);
 		expect(harness.notifications).toHaveLength(0);
 
 		// Second notice → L3 user escalation.
@@ -378,11 +386,13 @@ describe("P3 parked worker with claimable work", () => {
 		await harness.poll();
 		expect(harness.notifications.filter(n => n.title === "Team observer: parked-stall")).toHaveLength(1);
 
-		// Claim + complete the work → flag clears.
+		// Claim + complete the work → flag clears after the flap-grace scans.
 		const claimed = await harness.board.claim(created.task.id, "test");
 		if (!claimed.ok) throw new Error(claimed.message);
-		const completed = await harness.board.complete(created.task.id);
+		const completed = await harness.board.complete(created.task.id, undefined, "test");
 		if (!completed.ok) throw new Error(completed.message);
+		await harness.poll();
+		await harness.poll();
 		await harness.poll();
 		expect(harness.flags()).toHaveLength(0);
 	});
@@ -519,9 +529,11 @@ describe("P6 team-wide stall", () => {
 		const allIdleNudge = harness.nudges.find(n => n.body.includes("team is stalled"));
 		expect(allIdleNudge?.to).toBe("Idler");
 
-		// A running sub clears the stall.
+		// A running sub clears the stall (after the flap-grace scans).
 		harness.registry.setStatus("Idler", "running");
 		harness.setActivity("Idler", harness.clock.now);
+		await harness.poll();
+		await harness.poll();
 		await harness.poll();
 		expect(harness.flagKeys()).not.toContain("all-idle:board");
 	});
@@ -548,8 +560,10 @@ describe("P7 orphaned agents", () => {
 		expect(harness.nudges).toHaveLength(0);
 		expect(harness.notifications).toHaveLength(0);
 
-		// Parent registers → flag clears.
+		// Parent registers → flag clears after the flap-grace scans.
 		harness.register("Ghost", { kind: "sub", status: "idle" });
+		await harness.poll();
+		await harness.poll();
 		await harness.poll();
 		expect(harness.flags()).toHaveLength(0);
 	});
@@ -578,6 +592,48 @@ describe("action ladder", () => {
 		// L3 escalation still fires.
 		expect(harness.notifications.length).toBeGreaterThan(0);
 		expect(harness.nudges).toHaveLength(0);
+	});
+
+	it("dampens ladder state across flapping detection — no re-notice, no re-DM, delayed clear", async () => {
+		await harness.board.create({ title: "Flappy", createdBy: "test" });
+		harness.register("Sleeper", { status: "parked" });
+		harness.setActivity("Sleeper", harness.clock.now);
+		await harness.start();
+
+		// Stall detected → one notice + exactly one DM (P3 owns the parked
+		// worker; the co-firing all-idle detector sends no second DM).
+		harness.advance(STALL_MS + 1);
+		await harness.poll();
+		expect(harness.flagKeys()).toContain("parked-stall:Sleeper");
+		expect(harness.nudges.filter(n => n.to === "Sleeper")).toHaveLength(1);
+		const stallNotices = () => harness.statuses.filter(s => s.includes("claimable work on the board"));
+		expect(stallNotices()).toHaveLength(1);
+
+		// Flap: the worker runs for one scan — the flag survives the grace
+		// window instead of clearing and re-arming.
+		harness.registry.setStatus("Sleeper", "running");
+		harness.setActivity("Sleeper", harness.clock.now);
+		await harness.poll();
+		expect(harness.flagKeys()).toContain("parked-stall:Sleeper");
+
+		// Parked again (still stale): re-detection reuses the same flag — no
+		// fresh notice inside the window, no second DM.
+		harness.registry.setStatus("Sleeper", "parked");
+		harness.setActivity("Sleeper", harness.clock.now - STALL_MS - 1);
+		await harness.poll();
+		expect(harness.flagKeys()).toContain("parked-stall:Sleeper");
+		expect(stallNotices()).toHaveLength(1);
+		expect(harness.nudges.filter(n => n.to === "Sleeper")).toHaveLength(1);
+
+		// Sustained absence clears only after the grace scans.
+		harness.registry.setStatus("Sleeper", "running");
+		harness.setActivity("Sleeper", harness.clock.now);
+		await harness.poll();
+		await harness.poll();
+		expect(harness.flagKeys()).toContain("parked-stall:Sleeper");
+		await harness.poll();
+		expect(harness.flags()).toHaveLength(0);
+		expect(harness.statuses.some(s => s.includes("cleared") && s.includes("parked-stall"))).toBe(true);
 	});
 
 	it("observer.enabled=false hard-disables detection", async () => {

@@ -213,10 +213,12 @@ describe("completeEnsemble", () => {
 		expect(result).toBe(fallback);
 		expect(call).toBe(4);
 		expect(usage).toHaveLength(4);
-		// Members were cancelled; the fallback is wired to the external signal
-		// (undefined here — never the aborted internal controller).
+		// Members were cancelled; the fallback runs on its own live phase signal —
+		// never the aborted internal member controller.
 		for (const signal of memberSignals) expect(signal?.aborted).toBe(true);
-		expect(fallbackSignal?.aborted ?? false).toBe(false);
+		expect(fallbackSignal).toBeDefined();
+		expect(fallbackSignal?.aborted).toBe(false);
+		expect(memberSignals[0] === fallbackSignal).toBe(false);
 	});
 
 	it("times out before quorum, cancels members, and runs one direct fallback", async () => {
@@ -340,7 +342,123 @@ describe("completeEnsemble", () => {
 		expect(result).toBe(fallback);
 		expect(Date.now() - startedAt).toBeLessThan(1_000);
 		for (const signal of signals.slice(0, 3)) expect(signal?.aborted).toBe(true);
-		expect(signals[3]).toBe(external.signal);
+		// The fallback runs on its own phase signal — not the shared external
+		// one — which forwards the already-fired external abort.
+		expect(signals[3]).not.toBe(external.signal);
+		expect(signals[3]?.aborted).toBe(true);
+	});
+
+	it("bounds the fallback phase by a second timeoutMs for signal-less callers", async () => {
+		const model = buildSwarmModel();
+		const fallbackSignals: (AbortSignal | undefined)[] = [];
+		let call = 0;
+		vi.spyOn(ai, "completeSimple").mockImplementation((_model, _context, options) => {
+			call += 1;
+			if (call <= 3) return new Promise<AssistantMessage>(() => {});
+			fallbackSignals.push(options?.signal);
+			// A stalled provider: settles only when its signal fires.
+			return new Promise<AssistantMessage>(resolve => {
+				options?.signal?.addEventListener("abort", () => resolve(swarmMessage("", { stopReason: "aborted" })), {
+					once: true,
+				});
+			});
+		});
+
+		const startedAt = Date.now();
+		// No external signal: the internal deadline is the only thing that can
+		// stop the fallback (the mnemopi caller shape).
+		const result = await completeEnsemble(
+			{ model, context: CONTEXT },
+			{ members: 3, quorum: 2, graceMs: 5, timeoutMs: 50, synthesize: "vote" },
+		);
+
+		expect(Date.now() - startedAt).toBeLessThan(1_000);
+		expect(result.stopReason).toBe("aborted");
+		const fallbackSignal = fallbackSignals[0];
+		expect(fallbackSignal?.aborted).toBe(true);
+		const reason: unknown = fallbackSignal?.reason;
+		expect(reason).toBeInstanceOf(DOMException);
+		expect((reason as DOMException).name).toBe("TimeoutError");
+	});
+
+	it("cancels the run when the external abort lands after quorum", async () => {
+		const model = buildSwarmModel();
+		const external = new AbortController();
+		let call = 0;
+		vi.spyOn(ai, "completeSimple").mockImplementation(() => {
+			call += 1;
+			if (call <= 2) return Promise.resolve(swarmMessage("yes"));
+			// The straggler settles during the grace window — and the caller walks
+			// away in the same microtask, so the abort lands after quorum but
+			// before the vote returns. Deterministic: no wall-clock race.
+			return Promise.resolve().then(() => {
+				external.abort();
+				return swarmMessage("yes");
+			});
+		});
+
+		const pending = completeEnsemble(
+			{ model, context: CONTEXT },
+			{ members: 3, quorum: 2, graceMs: 200, timeoutMs: 5_000, synthesize: "vote", signal: external.signal },
+		);
+		const error: unknown = await pending.then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).name).toBe("AbortError");
+	});
+
+	it("propagates external cancellation mid-merge instead of returning a stale member answer", async () => {
+		const model = buildSwarmModel();
+		const answers = ["alpha", "beta", "gamma"].map(text => swarmMessage(text));
+		const external = new AbortController();
+		let call = 0;
+		vi.spyOn(ai, "completeSimple").mockImplementation(() => {
+			call += 1;
+			if (call <= 3) return Promise.resolve(answers[call - 1]);
+			// The caller walks away mid-synthesis; the synthesizer settles aborted.
+			external.abort();
+			return Promise.resolve(swarmMessage("", { stopReason: "aborted" }));
+		});
+
+		const pending = completeEnsemble(
+			{ model, context: CONTEXT },
+			{ members: 3, quorum: 2, graceMs: 5, timeoutMs: 5_000, synthesize: "merge", signal: external.signal },
+		);
+		const error: unknown = await pending.then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).name).toBe("AbortError");
+	});
+
+	it("bounds the merge synthesizer by the internal deadline, falling back to the earliest member", async () => {
+		const model = buildSwarmModel();
+		const answers = ["alpha", "beta", "gamma"].map(text => swarmMessage(text));
+		let call = 0;
+		vi.spyOn(ai, "completeSimple").mockImplementation((_model, _context, options) => {
+			call += 1;
+			if (call <= 3) return Promise.resolve(answers[call - 1]);
+			// A stalled synthesizer: settles only when its signal fires.
+			return new Promise<AssistantMessage>(resolve => {
+				options?.signal?.addEventListener("abort", () => resolve(swarmMessage("", { stopReason: "aborted" })), {
+					once: true,
+				});
+			});
+		});
+
+		const startedAt = Date.now();
+		const result = await completeEnsemble(
+			{ model, context: CONTEXT },
+			{ members: 3, quorum: 2, graceMs: 5, timeoutMs: 50, synthesize: "merge" },
+		);
+
+		// Internal deadline (no external signal): the earliest member answer is
+		// the designed synthesizer-failure fallback.
+		expect(Date.now() - startedAt).toBeLessThan(1_000);
+		expect(result).toBe(answers[0]);
 	});
 });
 

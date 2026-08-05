@@ -39,7 +39,7 @@ import {
 import type { AgentHubRemote } from "./agent-hub";
 import { formatAgentRow } from "./agent-row";
 import { AgentTranscriptViewer } from "./agent-transcript-viewer";
-import { keyHint, rawKeyHint } from "./keybinding-hints";
+import { editorKey, keyHint, rawKeyHint } from "./keybinding-hints";
 
 /** Max agent rows before the overflow summary — mirrors SUBAGENT_HUD_VISIBLE_LIMIT. */
 export const AGENT_PANEL_VISIBLE_LIMIT = 8;
@@ -169,7 +169,9 @@ export class AgentPanelComponent extends Container {
 			const hints = [
 				rawKeyHint("↑/↓", "select"),
 				keyHint("tui.select.confirm", "open"),
-				rawKeyHint("Esc", "interrupt"),
+				// Live binding, like the hub footer: rebinding app.interrupt off
+				// Esc must not leave the hint advertising a dead key.
+				rawKeyHint(editorKey("app.interrupt") || "Esc", "interrupt"),
 				rawKeyHint("←", "editor"),
 			].join(theme.fg("dim", "  "));
 			lines.push(` ${hints}`);

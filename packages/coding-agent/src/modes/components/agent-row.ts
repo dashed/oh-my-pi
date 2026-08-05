@@ -35,7 +35,7 @@ export function sanitizeLine(text: string, maxWidth?: number): string {
 }
 
 /** Status glyph, colored per theme status conventions. The title-line counts spell out the words. */
-export function statusGlyph(status: AgentStatus): string {
+function statusGlyph(status: AgentStatus): string {
 	switch (status) {
 		case "running":
 			return theme.fg("accent", theme.status.running);
@@ -168,7 +168,9 @@ export function formatAgentRow(
 
 	const task = observed?.description ?? observed?.progress?.task ?? ref.activity;
 	if (task) {
-		entry.push(`     ${theme.fg("muted", sanitizeLine(task, Math.max(10, max - 5)))}`);
+		// Model/collab-chosen text: strip control bytes (sanitizeText) before
+		// the single-line/truncate pass, mirroring displayName/currentTool.
+		entry.push(`     ${theme.fg("muted", sanitizeLine(sanitizeText(task), Math.max(10, max - 5)))}`);
 	}
 	return entry;
 }

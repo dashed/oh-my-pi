@@ -499,7 +499,6 @@ export class AdvisorRuntime {
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
 		this.#failureNotified = false;
-		this.#quarantineNoticeActive = false;
 		this.#advisorRegexSecretValues.clear();
 		this.#wakeAllWaiters();
 		try {
@@ -598,7 +597,6 @@ export class AdvisorRuntime {
 		this.#droppedBacklogs = 0;
 		this.#consecutiveQuarantines = 0;
 		this.#failureNotified = false;
-		this.#quarantineNoticeActive = false;
 		this.#resetAdvisorContext(true, true);
 	}
 
@@ -620,7 +618,6 @@ export class AdvisorRuntime {
 		this.#failing = false;
 		this.#droppedBacklogs = 0;
 		this.#failureNotified = false;
-		this.#quarantineNoticeActive = false;
 		this.#clearSeenContext();
 		this.#wakeAllWaiters();
 	}
@@ -991,17 +988,7 @@ export class AdvisorRuntime {
 					success = true;
 					this.#failing = false;
 					this.#consecutiveFailures = 0;
-					// A quarantine-halt notice re-arms only when the advisor actually
-					// delivers advice (or on explicit reset) — a silent/advice-less
-					// success must not re-arm it. Other failure notices keep the
-					// legacy re-arm-on-any-success behavior.
-					if (
-						!this.#quarantineNoticeActive ||
-						messagesContainAdviseCall(this.agent.state.messages.slice(messageSnapshot))
-					) {
-						this.#failureNotified = false;
-						this.#quarantineNoticeActive = false;
-					}
+					this.#failureNotified = false;
 					this.#droppedBacklogs = 0;
 					this.#consecutiveQuarantines = 0;
 					if (this.host.onTurnSuccess) {
@@ -1095,8 +1082,13 @@ export class AdvisorRuntime {
 						// turn for zero delivered advice (issue #6661).
 						this.#consecutiveQuarantines++;
 						if (this.#consecutiveQuarantines >= MAX_QUARANTINE_RETRIES) {
+							// Force the halt notice past the shared #failureNotified
+							// latch: an earlier failure notice only re-arms on a
+							// successful turn, which a halted advisor can never reach —
+							// without the clear, two consecutive quarantines after a
+							// failure streak would halt silently.
+							this.#failureNotified = false;
 							this.#notifyFailureOnce(err);
-							this.#quarantineNoticeActive = true;
 							this.#consecutiveQuarantines = 0;
 							this.#halted = true;
 							this.#pending = [];

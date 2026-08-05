@@ -4251,6 +4251,67 @@ describe("advisor", () => {
 			expect(runtime.failureNotified).toBe(false);
 		});
 
+		it("still surfaces the quarantine-halt notice after an earlier failure notice latched (issue #6661)", async () => {
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const promptInputs: string[] = [];
+			let mode: "generic" | "quarantine" = "generic";
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					state.messages.push({ role: "user", content: input, timestamp: Date.now() } as AgentMessage);
+					if (mode === "quarantine") {
+						throw new AdvisorOutputQuarantinedError(
+							"Advisor response quarantined: requested unavailable tool bash",
+						);
+					}
+					throw new Error("provider boom");
+				},
+				abort: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
+				rollbackTo: count => {
+					if (count < state.messages.length) state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const notifyFailures: string[] = [];
+			const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				grantedToolNames: () => ["advise", "read", "grep", "glob"],
+				notifyFailure: err => notifyFailures.push(err instanceof Error ? err.message : String(err)),
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			// A generic failure streak latches the shared failure-notice flag
+			// (3 consecutive failures → drop + one notice), with no successful
+			// turn to re-arm it.
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => runtime.backlog === 0);
+			expect(notifyFailures).toEqual(["provider boom"]);
+			expect(runtime.failureNotified).toBe(true);
+			expect(runtime.halted).toBe(false);
+
+			// Two consecutive quarantines then halt the advisor: the halt notice
+			// must fire even though the shared latch is already set — otherwise
+			// the advisor is silently off for the rest of the session.
+			mode = "quarantine";
+			messages.push({ role: "user", content: "bbb", timestamp: 2 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => runtime.backlog === 0 && runtime.halted);
+
+			expect(notifyFailures).toEqual([
+				"provider boom",
+				"Advisor response quarantined: requested unavailable tool bash",
+			]);
+			expect(runtime.failureNotified).toBe(true);
+			expect(runtime.halted).toBe(true);
+		});
+
 		it("drops the in-flight batch when a reset aborts the advisor prompt", async () => {
 			const promptInputs: string[] = [];
 			const { promise: firstPromptStarted, resolve: startFirstPrompt } = Promise.withResolvers<void>();

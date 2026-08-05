@@ -1352,6 +1352,11 @@ export class EventController {
 		if (notice) this.ctx.showStatus(notice, { dim: true });
 	}
 
+	/** Re-arm the slow/flaky notice dedup for a slug (wired to `/provider unignore`). */
+	resetProviderHealthNotice(slug: string): void {
+		this.#providerHealthNotifier.reset(slug);
+	}
+
 	#notifyIfFlaky(tracker: RoutingStatsTracker, slug: string): void {
 		const notice = this.#providerHealthNotifier.maybeNotifyFlaky(tracker, slug, this.#flakyProviderThresholds());
 		if (notice) this.ctx.showStatus(notice, { dim: true });

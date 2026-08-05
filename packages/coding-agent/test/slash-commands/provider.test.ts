@@ -102,6 +102,33 @@ describe("/provider ignore|unignore", () => {
 		expect(output).toHaveBeenCalledWith("Removed deepinfra from the ignore list — effective on the next request.");
 	});
 
+	it("unignore re-arms the session slow/flaky notice through onUnignore", async () => {
+		const settings = Settings.isolated();
+		settings.set("providers.openrouter.ignore", ["deepinfra"]);
+		const onUnignore = vi.fn();
+		const text = await runProviderCommand("unignore deepinfra", {
+			settings,
+			session: { settings, model: undefined } as unknown as SlashCommandRuntime["session"],
+			tracker: new RoutingStatsTracker({ hydrate: false }),
+			onUnignore,
+		});
+		expect(text).toContain("Removed deepinfra");
+		expect(onUnignore).toHaveBeenCalledTimes(1);
+		expect(onUnignore).toHaveBeenCalledWith("deepinfra");
+	});
+
+	it("ignore does not touch the notifier hook", async () => {
+		const settings = Settings.isolated();
+		const onUnignore = vi.fn();
+		await runProviderCommand("ignore deepinfra", {
+			settings,
+			session: { settings, model: undefined } as unknown as SlashCommandRuntime["session"],
+			tracker: new RoutingStatsTracker({ hydrate: false }),
+			onUnignore,
+		});
+		expect(onUnignore).not.toHaveBeenCalled();
+	});
+
 	it("unignore on a missing slug says so", async () => {
 		const settings = Settings.isolated();
 		const { output, runtime } = acpRuntime(settings);

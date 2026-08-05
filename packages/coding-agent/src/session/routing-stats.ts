@@ -26,6 +26,12 @@ import { getAgentDir, logger } from "@oh-my-pi/pi-utils";
 export const ROUTING_STATS_WINDOW = 20;
 /** Minimum turns before a slug can be flagged slow (avoids one-off verdicts). */
 export const ROUTING_STATS_MIN_TURNS = 3;
+/**
+ * Minimum samples reporting a given metric before its median can flag a
+ * slug — a median over one sample IS that sample, so a single outlier turn
+ * would otherwise trip the slow notice.
+ */
+const ROUTING_STATS_MIN_METRIC_SAMPLES = 2;
 
 const ROUTING_STATS_FILE_VERSION = 1;
 const DEFAULT_SAVE_THROTTLE_MS = 2_000;
@@ -263,7 +269,7 @@ export class RoutingStatsTracker {
 	readonly #samples = new Map<string, RoutingTurnSample[]>();
 	readonly #errors = new Map<string, RoutingErrorSample[]>();
 	#hydrated: Promise<void>;
-	#saveTimer: ReturnType<typeof setTimeout> | undefined;
+	#saveTimer: NodeJS.Timeout | undefined;
 	#saveChain: Promise<void> = Promise.resolve();
 	#dirty = false;
 
@@ -327,13 +333,24 @@ export class RoutingStatsTracker {
 	slowReason(slug: string, thresholds: SlowProviderThresholds): string | undefined {
 		const summary = this.getSummary(slug);
 		if (!summary || summary.turns < ROUTING_STATS_MIN_TURNS) return undefined;
+		// Per-metric floors: each median runs over only the turns that reported
+		// that metric, and a one-sample "median" IS that sample — one outlier
+		// turn must not trip the ban-suggestion notice.
+		const samples = this.#samples.get(slug) ?? [];
+		const tpsSamples = samples.filter(sample => sample.tokensPerSecond !== undefined).length;
+		const ttftSamples = samples.filter(sample => sample.ttftMs !== undefined).length;
 		if (
+			tpsSamples >= ROUTING_STATS_MIN_METRIC_SAMPLES &&
 			summary.medianTokensPerSecond !== undefined &&
 			summary.medianTokensPerSecond < thresholds.minTokensPerSecond
 		) {
 			return `${summary.medianTokensPerSecond.toFixed(1)} tok/s median`;
 		}
-		if (summary.ttftP50Ms !== undefined && summary.ttftP50Ms > thresholds.maxTtftMs) {
+		if (
+			ttftSamples >= ROUTING_STATS_MIN_METRIC_SAMPLES &&
+			summary.ttftP50Ms !== undefined &&
+			summary.ttftP50Ms > thresholds.maxTtftMs
+		) {
 			return `ttft p50 ${(summary.ttftP50Ms / 1000).toFixed(1)}s`;
 		}
 		return undefined;
@@ -560,12 +577,6 @@ export function getRoutingStatsTracker(): RoutingStatsTracker {
 		});
 	}
 	return defaultTracker;
-}
-
-/** Test hook: drop the process-wide tracker so the next access re-creates it. */
-export function resetRoutingStatsTrackerForTests(): void {
-	defaultTracker?.dispose();
-	defaultTracker = undefined;
 }
 
 /**

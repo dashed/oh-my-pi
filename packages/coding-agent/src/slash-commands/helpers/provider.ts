@@ -39,6 +39,12 @@ export interface ProviderCommandDeps {
 	tracker?: RoutingStatsTracker;
 	/** Endpoint-perf cache; defaults to the shared 60s cache. */
 	endpointCache?: OpenRouterEndpointStatsCache;
+	/**
+	 * Re-arm the session's slow/flaky notice dedup for a slug after unignore —
+	 * without it the notice stays silenced for the rest of the session even
+	 * when the slug is still slow. Absent where no notifier exists (ACP).
+	 */
+	onUnignore?: (slug: string) => void;
 	/** Fetch override for tests. */
 	fetchImpl?: typeof fetch;
 }
@@ -157,5 +163,6 @@ export async function runProviderCommand(args: string, deps: ProviderCommandDeps
 		current.filter(entry => entry !== slug),
 	);
 	await settings.flush();
+	deps.onUnignore?.(slug);
 	return `Removed ${sanitizeSlug(slug)} from the ignore list — effective on the next request.`;
 }

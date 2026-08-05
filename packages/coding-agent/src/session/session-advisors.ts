@@ -881,7 +881,18 @@ export class SessionAdvisors {
 					advisorRef.adviseTool.beginUpdate(inProgress);
 					advisorRef.emissionGuard.beginUpdate();
 				},
-				grantedToolNames: () => advisorLoopTools.map(tool => tool.name),
+				// Name the set the quarantine gate actually checks — the tool
+				// names plus every customWireName alias, and `delete` when the
+				// advisor can mutate files (the Cursor native-delete grant).
+				// Understating it would feed the model a factually wrong
+				// toolset on the one turn designed to re-teach it.
+				grantedToolNames: () => {
+					const names = advisorLoopTools.flatMap(tool =>
+						tool.customWireName !== undefined ? [tool.name, tool.customWireName] : [tool.name],
+					);
+					if (advisorCanMutateFiles) names.push("delete");
+					return names;
+				},
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {

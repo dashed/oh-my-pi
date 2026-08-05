@@ -16,7 +16,8 @@ import type {
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
-import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
+import teamDescription from "../prompts/tools/team.md" with { type: "text" };
 import {
 	isValidTaskId,
 	resolveTeamBoardDir,
@@ -64,17 +65,6 @@ const TITLE_MAX = 200;
 const TEXT_MAX = 4000;
 const BLOCKED_BY_MAX = 32;
 
-const TEAM_DESCRIPTION = `Shared task board for the agent team of this session. Every agent (main + all subagents) reads and writes the same board, stored at ~/.omp/teams/<root-session>/tasks/.
-
-Ops:
-- list: show board tasks, newest context first: id, title, status, claimedBy, unresolved blockers. Optional status filter.
-- create: publish a task (title required; description and blockedBy optional). blockedBy lists task ids that must complete before this task becomes claimable. Returns the new task id.
-- claim: atomically claim a pending task for yourself (taskId). Fails with a conflict if another agent already claimed it, or as blocked while any blockedBy prerequisite is not done.
-- complete: mark your claimed task done (taskId, optional result). Clears the task from every dependent's blockedBy so they become claimable.
-- release: give up a claimed task (taskId), returning it to pending for someone else.
-
-Workflow: create or list to find pending work, claim before starting (exactly one agent wins a claim), complete with a result when done. Check list again after completing — completed prerequisites unblock dependent tasks.`;
-
 function cleanText(value: string, max: number): string {
 	return sanitizeText(value).trim().slice(0, max);
 }
@@ -103,7 +93,7 @@ export class TeamTool implements AgentTool<typeof teamSchema, TeamToolDetails> {
 	readonly approval = teamApproval;
 	readonly label = "Team";
 	readonly summary = "Read, claim, and complete tasks on the agent team's shared task board";
-	readonly description = TEAM_DESCRIPTION;
+	readonly description = prompt.render(teamDescription);
 	readonly parameters = teamSchema;
 	readonly strict = true;
 
@@ -193,11 +183,15 @@ export class TeamTool implements AgentTool<typeof teamSchema, TeamToolDetails> {
 					actor,
 					params,
 					taskId =>
-						board.complete(taskId, params.result !== undefined ? cleanText(params.result, TEXT_MAX) : undefined),
+						board.complete(
+							taskId,
+							params.result !== undefined ? cleanText(params.result, TEXT_MAX) : undefined,
+							actor,
+						),
 					"completed",
 				);
 			case "release":
-				return this.#mutate(teamId, actor, params, taskId => board.release(taskId), null);
+				return this.#mutate(teamId, actor, params, taskId => board.release(taskId, actor), null);
 		}
 	}
 

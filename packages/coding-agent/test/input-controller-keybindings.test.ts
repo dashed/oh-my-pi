@@ -32,6 +32,7 @@ type FakeEditor = {
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => void): void;
+	removeCustomKeyHandler(key: string): void;
 	clearCustomKeyHandlers(): void;
 	pasteText(text: string): void;
 	imageLinks?: (string | undefined)[];
@@ -69,6 +70,9 @@ async function createContext() {
 	const setActionKeys = vi.fn();
 	const setCustomKeyHandler = vi.fn((key: string, handler: () => void) => {
 		customHandlers.set(key, handler);
+	});
+	const removeCustomKeyHandler = vi.fn((key: string) => {
+		customHandlers.delete(key);
 	});
 	const clearCustomKeyHandlers = vi.fn(() => {
 		customHandlers.clear();
@@ -127,6 +131,7 @@ async function createContext() {
 		},
 		setActionKeys,
 		setCustomKeyHandler,
+		removeCustomKeyHandler,
 		clearCustomKeyHandlers,
 		pendingImages: [],
 		pendingImageLinks: [],
