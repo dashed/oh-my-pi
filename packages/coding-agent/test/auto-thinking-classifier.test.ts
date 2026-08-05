@@ -228,7 +228,7 @@ describe("auto thinking classifier helpers", () => {
 			| undefined;
 
 		expect(effort).toBe(Effort.High);
-		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 1024 });
+		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 2048 });
 	});
 
 	function createOnlineFixture(targetModel: Model, answer: string, maxEffort: "xhigh" | "max" = "xhigh") {

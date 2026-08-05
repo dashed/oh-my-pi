@@ -118,6 +118,10 @@ describe("AgentSession eager todo enforcement", () => {
 			"todo.eager": "always",
 			"todo.reminders": false,
 			"title.refreshOnReplan": false,
+			// These tests assert the todo→title wiring with a single completion
+			// call; swarm fan-out (3 identical member calls) is covered in
+			// swarm-ensemble.test.ts.
+			"swarm.enabled": false,
 			...settingsOverride,
 		});
 		const sessionManager = SessionManager.inMemory(tempDir.path());

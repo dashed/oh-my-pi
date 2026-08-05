@@ -32,6 +32,7 @@ import type { RecoveredRetryError } from "../extensibility/shared-events";
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
 import thinkingLoopRedirectTemplate from "../prompts/system/thinking-loop-redirect.md" with { type: "text" };
 import unexpectedStopRetryTemplate from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
+import { resolveSwarmConfig, swarmCallerBudgetMs } from "../swarm/ensemble";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -626,7 +627,15 @@ export class TurnRecovery {
 		}
 
 		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), UNEXPECTED_STOP_TIMEOUT_MS);
+		// The 4s legacy budget is sized for one reasoning-disabled 2048-token
+		// call. With the swarm enabled, members reason at full effort (observed
+		// latency is stochastic, up to ~19s), so the caller budget must cover the
+		// member phase plus the one-call fallback phase.
+		const swarm = resolveSwarmConfig(this.#host.settings, "unexpectedStop");
+		const timeout = setTimeout(
+			() => controller.abort(),
+			swarm.enabled ? swarmCallerBudgetMs(swarm) : UNEXPECTED_STOP_TIMEOUT_MS,
+		);
 		let classification: boolean | undefined;
 		try {
 			classification = await classifyUnexpectedStop(text, {

@@ -18,6 +18,7 @@ import type {
 import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { completeEnsemble, createEnsembleUsageRecorder, resolveSwarmConfig } from "../swarm/ensemble";
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "../tools/render-utils";
@@ -545,17 +546,34 @@ async function resolveMnemopiProviderOptions(
 					});
 					return null;
 				}
-				const message = await completeSimple(
-					model,
-					{
-						messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-					},
-					{
-						apiKey: modelRegistry.resolver(model, sessionId),
-						maxTokens: opts?.maxTokens,
-						temperature: opts?.temperature,
-					},
-				);
+				const context = {
+					messages: [{ role: "user" as const, content: prompt, timestamp: Date.now() }],
+				};
+				const baseOptions = {
+					apiKey: modelRegistry.resolver(model, sessionId),
+					temperature: opts?.temperature,
+				};
+				// Swarm adoption is opt-in here (`swarm.mnemopi`, default off):
+				// extraction/consolidation outputs are long-form — not voteable — and
+				// memory runs are background batch work where the 3x billing
+				// multiplier buys no accuracy over one full-strength call. When
+				// enabled, `merge` synthesis reconciles the member answers; the
+				// caller's maxTokens is dropped in favor of natural stops (swarm
+				// members are always uncapped).
+				const swarm = resolveSwarmConfig(settings, "mnemopi");
+				const message = swarm.enabled
+					? await completeEnsemble(
+							{ model, context, options: baseOptions },
+							{
+								members: swarm.members,
+								quorum: swarm.quorum,
+								timeoutMs: swarm.timeoutMs,
+								graceMs: swarm.graceMs,
+								synthesize: "merge",
+								recordUsage: createEnsembleUsageRecorder(modelRegistry, sessionId),
+							},
+						)
+					: await completeSimple(model, context, { ...baseOptions, maxTokens: opts?.maxTokens });
 				return message.content
 					.filter(
 						(block): block is Extract<(typeof message.content)[number], { type: "text" }> =>

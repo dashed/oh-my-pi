@@ -391,7 +391,7 @@ describe("title generator", () => {
 		expect(maxTokens).toBeGreaterThanOrEqual(1024);
 	});
 
-	it("strips code blocks from the message sent to the model", async () => {
+	it("sends the complete, untruncated message to the online model", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
 		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
 			stopReason: "stop",
@@ -404,10 +404,12 @@ describe("title generator", () => {
 			createSettings(model),
 		);
 
+		// The online title model owns a full-size context window, so the input is
+		// passed complete (no tiny-model code-block stripping, no length cap).
 		const sentMessages = (completeSimpleMock.mock.calls[0]?.[1] as { messages?: Array<{ content?: string }> })
 			?.messages;
 		const userContent = sentMessages?.[0]?.content ?? "";
-		expect(userContent).not.toContain("Claude Code v2.1.158");
+		expect(userContent).toContain("Claude Code v2.1.158");
 		expect(userContent).toContain("pick provider then theme");
 	});
 

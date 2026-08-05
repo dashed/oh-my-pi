@@ -23,6 +23,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import difficultySystemPrompt from "../prompts/system/auto-thinking-difficulty.md" with { type: "text" };
 import difficultyLocalPrompt from "../prompts/system/auto-thinking-difficulty-local.md" with { type: "text" };
+import { completeEnsemble, createEnsembleUsageRecorder, resolveSwarmConfig } from "../swarm/ensemble";
 import { clampAutoThinkingEffort } from "../thinking";
 import { preprocessTinyMessage } from "../tiny/message-preproc";
 import {
@@ -61,13 +62,21 @@ function difficultySystemPromptFor(ceiling: Effort): string {
 /** Local classifiers occasionally need more room for chat-template boilerplate. */
 const LOCAL_ANSWER_MAX_TOKENS = 16;
 /**
- * Online classifier budget. Sized to survive backends that ignore
- * `disableReasoning` (e.g. Qwen3 via llama.cpp catalogued `reasoning: false`
- * but still emitting thinking): the classifier keyword needs to land after any
- * unavoidable thinking preamble. `maxTokens` is a hard cap — non-thinking
- * completions still return in a handful of tokens (issue #4355).
+ * Local reasoning-model budget. Sized to survive on-device chat templates that
+ * force `enable_thinking` (e.g. Qwen3 via llama.cpp catalogued `reasoning:
+ * false` but still emitting thinking): the classifier keyword needs to land
+ * after any unavoidable thinking preamble. `maxTokens` is a hard cap —
+ * non-thinking completions still return in a handful of tokens (issue #4355).
  */
 const REASONING_SAFE_MAX_TOKENS = 1024;
+/**
+ * Online classifier budget for the legacy single-call path used when the
+ * swarm is disabled (`swarm.enabled: false`). Same reasoning-safe rationale as
+ * {@link REASONING_SAFE_MAX_TOKENS}, raised to the 2048 guardrail floor for
+ * max-effort-reasoning models. Swarm members run uncapped (see
+ * swarm/ensemble.ts).
+ */
+const ONLINE_ANSWER_GUARD_MAX_TOKENS = 2048;
 
 export interface ClassifyDifficultyDeps {
 	settings: Settings;
@@ -89,13 +98,17 @@ export async function classifyDifficulty(
 	deps: ClassifyDifficultyDeps,
 ): Promise<Effort | undefined> {
 	const backend = deps.settings.get("providers.autoThinkingModel");
-	const input = preprocessTinyMessage(promptText);
 	const online = backend === ONLINE_AUTO_THINKING_MODEL_KEY;
 	// The 3-bucket local classifier cannot select `max`, so its ceiling stays at
 	// XHigh whatever the setting says — otherwise a sparse ladder would snap its
 	// `hard` bucket up to a tier it never chose.
 	const ceiling = online ? autoEffortCeiling(deps) : Effort.XHigh;
-	const effort = online ? await classifyOnline(input, deps, ceiling) : await classifyLocal(input, backend, deps);
+	// Input policy differs by backend: the online model owns a full-size
+	// context window, so it classifies the COMPLETE, untruncated prompt; the
+	// on-device local classifier keeps the tiny-model cleanup + length bound.
+	const effort = online
+		? await classifyOnline(promptText, deps, ceiling)
+		: await classifyLocal(preprocessTinyMessage(promptText), backend, deps);
 	// The ceiling goes into the clamp itself: capping the request alone is not
 	// enough, because a sparse ladder snaps an excluded request back up.
 	return clampAutoThinkingEffort(deps.model, effort, ceiling);
@@ -113,22 +126,37 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceili
 	}
 	// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
 	const metadata = deps.metadataResolver?.(model.provider);
-	const maxTokens = REASONING_SAFE_MAX_TOKENS;
 
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: [difficultySystemPromptFor(ceiling)],
-			messages: [{ role: "user", content: input, timestamp: Date.now() }],
-		},
-		{
-			apiKey: deps.registry.resolver(model, deps.sessionId),
-			maxTokens,
-			disableReasoning: true,
-			metadata,
-			signal: deps.signal,
-		},
-	);
+	const swarm = resolveSwarmConfig(deps.settings, "autoThinking");
+	const context = {
+		systemPrompt: [difficultySystemPromptFor(ceiling)],
+		messages: [{ role: "user" as const, content: input, timestamp: Date.now() }],
+	};
+	const baseOptions = { apiKey: deps.registry.resolver(model, deps.sessionId), metadata };
+	const response = swarm.enabled
+		? // Swarm: N identical full-strength calls (reasoning on at the model's
+			// highest effort, no output cap), first quorum of level keywords wins
+			// by vote.
+			await completeEnsemble(
+				{ model, context, options: baseOptions },
+				{
+					members: swarm.members,
+					quorum: swarm.quorum,
+					timeoutMs: swarm.timeoutMs,
+					graceMs: swarm.graceMs,
+					synthesize: "vote",
+					signal: deps.signal,
+					recordUsage: createEnsembleUsageRecorder(deps.registry, deps.sessionId),
+				},
+			)
+		: // Legacy single call: reasoning disabled, guardrail ceiling (2048 —
+			// sized for backends that ignore `disableReasoning`).
+			await completeSimple(model, context, {
+				...baseOptions,
+				maxTokens: ONLINE_ANSWER_GUARD_MAX_TOKENS,
+				disableReasoning: true,
+				signal: deps.signal,
+			});
 
 	if (response.stopReason === "error") {
 		throw new Error(`auto-thinking: online classification failed: ${response.errorMessage ?? "unknown error"}`);

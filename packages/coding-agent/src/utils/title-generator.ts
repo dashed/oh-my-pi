@@ -13,7 +13,8 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
-import { formatTitleUserMessage } from "../tiny/message-preproc";
+import { completeEnsemble, createEnsembleUsageRecorder, resolveSwarmConfig } from "../swarm/ensemble";
+import { formatTitleUserMessageOnline } from "../tiny/message-preproc";
 import { isTinyTitleLocalModelKey, ONLINE_TINY_TITLE_MODEL_KEY } from "../tiny/models";
 import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
@@ -84,8 +85,11 @@ function disposeWindowsConsoleTitleApi(): void {
 // that never emits thinking. `maxTokens` is a hard cap, not a target — the
 // happy-path completion still returns in a handful of tokens, so raising the
 // ceiling costs nothing when thinking is genuinely suppressed and keeps the
-// `<title>` marker output reachable when it isn't (issue #4355).
-const TITLE_MAX_TOKENS = 1024;
+// `<title>` marker output reachable when it isn't (issue #4355). 2048 is the
+// guardrail floor for max-effort-reasoning models; this cap applies ONLY to
+// the legacy single-call path used when the swarm is disabled — swarm members
+// run uncapped (see swarm/ensemble.ts).
+const TITLE_MAX_TOKENS = 2048;
 
 /** Matches the title the model wraps in `<title>...</title>`. */
 const TITLE_MARKER_GLOBAL_RE = /<title>([\s\S]*?)<\/title>|<title\s*\/>|<title>\s*$/gi;
@@ -227,7 +231,9 @@ export async function generateTitleOnline(
 	// the prompt's `{"title": ...}` JSON example verbatim as the session title;
 	// markers work uniformly everywhere.
 	const systemPrompt = titleSystemPrompt ? [titleSystemPrompt, TITLE_MARKER_INSTRUCTION] : [TITLE_SYSTEM_PROMPT];
-	const userMessage = formatTitleUserMessage(firstMessage);
+	// Online title models own a full-size window: the input is passed complete
+	// and untruncated (no tiny-model cleanup, no 2000-char cap).
+	const userMessage = formatTitleUserMessageOnline(firstMessage);
 	const modelName = `${model.provider}/${model.id}`;
 	const modelContext = {
 		sessionId,
@@ -248,25 +254,37 @@ export async function generateTitleOnline(
 		// account_uuid rather than the snapshot-at-call-site value.
 		const metadata = metadataResolver?.(model.provider);
 
-		// Title generation is a 3-7 word task, but the ceiling has to survive
-		// backends that ignore `disableReasoning` (see TITLE_MAX_TOKENS above).
-		const maxTokens = TITLE_MAX_TOKENS;
-		logger.debug("title-generator: request", { ...modelContext, maxTokens });
-
-		const response = await completeSimple(
-			model,
-			{
-				systemPrompt,
-				messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
-			},
-			{
-				apiKey: registry.resolver(model, sessionId),
-				maxTokens,
-				disableReasoning: true,
-				metadata,
-				signal,
-			},
-		);
+		const swarm = resolveSwarmConfig(settings, "title");
+		const context = {
+			systemPrompt,
+			messages: [{ role: "user" as const, content: userMessage, timestamp: Date.now() }],
+		};
+		const baseOptions = { apiKey: registry.resolver(model, sessionId), metadata };
+		const response = swarm.enabled
+			? // Swarm: N identical full-strength calls (reasoning on at the model's
+				// highest effort, no output cap), first quorum of `<title>` answers
+				// wins by vote.
+				await completeEnsemble(
+					{ model, context, options: baseOptions },
+					{
+						members: swarm.members,
+						quorum: swarm.quorum,
+						timeoutMs: swarm.timeoutMs,
+						graceMs: swarm.graceMs,
+						synthesize: "vote",
+						signal,
+						recordUsage: createEnsembleUsageRecorder(registry, sessionId),
+					},
+				)
+			: // Legacy single call: reasoning disabled, guardrail ceiling (2048 —
+				// sized for backends that ignore `disableReasoning`; see
+				// TITLE_MAX_TOKENS above).
+				await completeSimple(model, context, {
+					...baseOptions,
+					maxTokens: TITLE_MAX_TOKENS,
+					disableReasoning: true,
+					signal,
+				});
 
 		if (response.stopReason === "error") {
 			logger.warn("title-generator: response error", {

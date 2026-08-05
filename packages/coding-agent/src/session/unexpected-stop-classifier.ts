@@ -5,6 +5,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import unexpectedStopClassifierPrompt from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
+import { completeEnsemble, createEnsembleUsageRecorder, resolveSwarmConfig } from "../swarm/ensemble";
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
 
@@ -16,13 +17,16 @@ const CLASSIFIER_SYSTEM_PROMPT = prompt.render(unexpectedStopClassifierPrompt);
  */
 const ANSWER_MAX_TOKENS = 16;
 /**
- * Online classifier budget. Sized to survive backends that ignore
- * `disableReasoning` (e.g. Qwen3 via llama.cpp catalogued `reasoning: false`
- * but still emitting thinking): the yes/no keyword needs to land after any
- * unavoidable thinking preamble. `maxTokens` is a hard cap — non-thinking
- * completions still return in a single word (issue #4355).
+ * Online classifier budget for the legacy single-call path used when the
+ * swarm is disabled (`swarm.enabled: false`). Sized to survive backends that
+ * ignore `disableReasoning` (e.g. Qwen3 via llama.cpp catalogued
+ * `reasoning: false` but still emitting thinking): the yes/no keyword needs to
+ * land after any unavoidable thinking preamble. `maxTokens` is a hard cap —
+ * non-thinking completions still return in a single word (issue #4355). 2048
+ * is the guardrail floor for max-effort-reasoning models; swarm members run
+ * uncapped (see swarm/ensemble.ts).
  */
-const REASONING_SAFE_MAX_TOKENS = 1024;
+const REASONING_SAFE_MAX_TOKENS = 2048;
 
 export interface ClassifyUnexpectedStopDeps {
 	settings: Settings;
@@ -86,22 +90,37 @@ async function classifyOnline(text: string, deps: ClassifyUnexpectedStopDeps): P
 		throw new Error(`unexpected-stop: no API key for ${model.provider}/${model.id}`);
 	}
 	const metadata = deps.metadataResolver?.(model.provider);
-	const maxTokens = REASONING_SAFE_MAX_TOKENS;
 
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: [CLASSIFIER_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: text, timestamp: Date.now() }],
-		},
-		{
-			apiKey: deps.registry.resolver(model, deps.sessionId),
-			maxTokens,
-			disableReasoning: true,
-			metadata,
-			signal: deps.signal,
-		},
-	);
+	const swarm = resolveSwarmConfig(deps.settings, "unexpectedStop");
+	const context = {
+		systemPrompt: [CLASSIFIER_SYSTEM_PROMPT],
+		messages: [{ role: "user" as const, content: text, timestamp: Date.now() }],
+	};
+	const baseOptions = { apiKey: deps.registry.resolver(model, deps.sessionId), metadata };
+	const response = swarm.enabled
+		? // Swarm: N identical full-strength calls (reasoning on at the model's
+			// highest effort, no output cap), first quorum of yes/no answers wins
+			// by vote.
+			await completeEnsemble(
+				{ model, context, options: baseOptions },
+				{
+					members: swarm.members,
+					quorum: swarm.quorum,
+					timeoutMs: swarm.timeoutMs,
+					graceMs: swarm.graceMs,
+					synthesize: "vote",
+					signal: deps.signal,
+					recordUsage: createEnsembleUsageRecorder(deps.registry, deps.sessionId),
+				},
+			)
+		: // Legacy single call: reasoning disabled, guardrail ceiling (2048 —
+			// sized for backends that ignore `disableReasoning`).
+			await completeSimple(model, context, {
+				...baseOptions,
+				maxTokens: REASONING_SAFE_MAX_TOKENS,
+				disableReasoning: true,
+				signal: deps.signal,
+			});
 
 	if (response.stopReason === "error") {
 		throw new Error(`unexpected-stop: online classification failed: ${response.errorMessage ?? "unknown error"}`);

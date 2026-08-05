@@ -4,6 +4,7 @@
 
 ### Added
 
+- Add an opt-out swarm ensemble for tiny-tier background calls (`swarm.*` settings): three identical full-strength parallel calls (reasoning enabled, no per-member handicaps, uncapped output, full context window) with a 2-of-3 quorum, majority-vote for classifiers and a merge pass for generation, plus a single-call fallback on quorum failure. Fixes tiny-role calls returning empty on reasoning models: classifier/title budgets raised (1024→2048) and prompts are no longer truncated below the model window.
 - Add a persistent agent panel below the prompt editor listing live subagents (shared row renderer with the Agent Hub): `alt+down`/`ctrl+down` to enter, arrows to select, `Enter` to open a teammate's transcript and message it directly, `Esc` to interrupt the selected agent's current turn without killing it.
 - Add a shared team task board via a new `team` tool: tasks live file-backed under `~/.omp/teams/<session>/` with lock-protected claim/complete/release and `blockedBy` dependency gating, so subagents self-coordinate pull-style; claims and completions broadcast over hub.
 - Add OpenRouter routing control: per-provider rolling stats (median tok/s, TTFT p50) persisted to `~/.omp/agent/routing-stats.json` and surfaced by `/provider`, enriched with OpenRouter-reported latency/throughput; slow providers trigger a one-line notice with a ready ban command; `providers.openrouter.{ignore,only,order,sort}` settings apply per request without restart, and `/provider ignore|unignore <slug>` persists bans to `config.yml`.

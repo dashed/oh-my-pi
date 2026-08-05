@@ -129,6 +129,16 @@ export function formatTitleUserMessage(message: string): string {
 	return `<user>\n${preprocessTinyMessage(message)}\n</user>`;
 }
 
+/** Wrap a RAW user message for ONLINE title generation. Unlike the local
+ *  on-device path ({@link formatTitleUserMessage}), online title models have a
+ *  full-size context window, so the input is neither cleaned nor length-bound:
+ *  the model's own window is the only ceiling. Preformatted replan contexts
+ *  still pass through untouched. */
+export function formatTitleUserMessageOnline(message: string): string {
+	if (isPreformattedChatContext(message)) return message;
+	return `<user>\n${message}\n</user>`;
+}
+
 /** One recent conversation turn supplied to title refresh after replanning. */
 export interface TitleConversationTurn {
 	role: "user" | "assistant";

@@ -416,4 +416,23 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		const message = createProviderErrorMessage(model, new Error("fetch failed"));
 		expect(recovery.isRetryableError(message)).toBe(true);
 	});
+
+	it("does not loop-retry a provider-surfaced incomplete-stream error after partial visible text", () => {
+		const recovery = new TurnRecovery(createHost(model, modelRegistry));
+		// The OpenAI responses provider already burned its transient-stream retry
+		// budget before surfacing this; the forwarded partial text is committed,
+		// so the loop must not replay the turn.
+		const message = makeMessage([{ type: "text", text: "Partial answer before the stream died" }], model);
+		message.errorMessage = "OpenAI responses stream closed before a terminal response event was received";
+		message.errorId = AIError.create(AIError.Flag.Transient);
+		expect(recovery.isRetryableError(message)).toBe(false);
+	});
+
+	it("keeps a provider-surfaced incomplete-stream error retriable when nothing committed", () => {
+		const recovery = new TurnRecovery(createHost(model, modelRegistry));
+		const message = makeMessage([], model);
+		message.errorMessage = "OpenAI responses stream closed before a terminal response event was received";
+		message.errorId = AIError.create(AIError.Flag.Transient);
+		expect(recovery.isRetryableError(message)).toBe(true);
+	});
 });

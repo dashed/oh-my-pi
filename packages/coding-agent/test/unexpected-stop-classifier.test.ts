@@ -139,7 +139,7 @@ describe("classifyUnexpectedStop", () => {
 			| undefined;
 
 		expect(result).toBe(true);
-		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 1024 });
+		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 2048 });
 	});
 });
 

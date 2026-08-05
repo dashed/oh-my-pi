@@ -5213,6 +5213,33 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"swarm.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "providers",
+			group: "Tiny Model",
+			label: "Swarm Ensemble",
+			description:
+				"Run online tiny-model utility calls (session titles, auto-thinking and unexpected-stop classifiers) as a swarm of identical full-strength completions (reasoning on, no output cap) resolved by quorum vote, instead of one capped call.",
+		},
+	},
+	"swarm.mnemopi": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "providers",
+			group: "Tiny Model",
+			label: "Swarm for Memory (Mnemopi)",
+			description:
+				"Also run mnemopi's online extraction/consolidation calls through the swarm (merge synthesis). Off by default: memory runs are background batch work where the 3x billing multiplier buys no accuracy over one full-strength call.",
+		},
+	},
+	// Swarm shape knobs — config-file only (numbers without `options` are hidden from the UI).
+	"swarm.members": { type: "number", default: 3 },
+	"swarm.quorum": { type: "number", default: 2 },
+	"swarm.timeoutMs": { type: "number", default: 15_000 },
+
 	"providers.kimiApiFormat": {
 		type: "enum",
 		values: ["auto", "openai", "anthropic"] as const,

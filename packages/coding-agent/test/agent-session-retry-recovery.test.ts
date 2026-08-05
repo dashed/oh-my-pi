@@ -4,7 +4,9 @@ import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { ApiKeyResolveContext, AssistantMessage, AssistantRetryRecovery, Usage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import * as aiStream from "@oh-my-pi/pi-ai/stream";
+import type { FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -117,6 +119,55 @@ function successfulAssistantEntry(sessionManager: SessionManager, text: string):
 	return found;
 }
 
+function sseResponse(events: unknown[]): Response {
+	return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+/** Text deltas, then a clean EOF with no terminal response event. */
+function truncatedTextSseResponse(text: string, responseId: string): Response {
+	return sseResponse([
+		{ type: "response.created", response: { id: responseId, status: "in_progress" } },
+		{
+			type: "response.output_item.added",
+			output_index: 0,
+			item: { type: "message", id: `msg_${responseId}`, role: "assistant", status: "in_progress", content: [] },
+		},
+		{ type: "response.output_text.delta", output_index: 0, item_id: `msg_${responseId}`, delta: text },
+	]);
+}
+
+/** Stream acknowledged, then EOF before any output item — nothing ever committed. */
+function truncatedEmptySseResponse(responseId: string): Response {
+	return sseResponse([{ type: "response.created", response: { id: responseId, status: "in_progress" } }]);
+}
+
+function completedTextSseResponse(text: string, responseId: string): Response {
+	return sseResponse([
+		{ type: "response.created", response: { id: responseId, status: "in_progress" } },
+		{
+			type: "response.output_item.added",
+			output_index: 0,
+			item: { type: "message", id: `msg_${responseId}`, role: "assistant", status: "in_progress", content: [] },
+		},
+		{ type: "response.output_text.delta", output_index: 0, item_id: `msg_${responseId}`, delta: text },
+		{
+			type: "response.output_item.done",
+			output_index: 0,
+			item: {
+				type: "message",
+				id: `msg_${responseId}`,
+				role: "assistant",
+				status: "completed",
+				content: [{ type: "output_text", text }],
+			},
+		},
+		{ type: "response.completed", response: { id: responseId, status: "completed" } },
+	]);
+}
+
 describe("AgentSession retry recovery", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -208,6 +259,67 @@ describe("AgentSession retry recovery", () => {
 		await sessionManager.flush();
 
 		return { session, sessionManager, retryEndEvents, requestedKeys };
+	}
+
+	/**
+	 * Drive a turn through the real OpenAI responses provider with a scripted
+	 * fetch, so provider-internal transient-stream retries and the session-level
+	 * auto_retry saga are both exercised end to end.
+	 */
+	async function runOpenAIResponsesTruncation(fetchMock: FetchImpl): Promise<{
+		sessionManager: SessionManager;
+		retryEndEvents: AutoRetryEndEvent[];
+	}> {
+		const model = getBundledModel("openai", "gpt-5-mini");
+		if (!model) {
+			throw new Error("Expected bundled OpenAI test model to exist");
+		}
+		authStorage.setRuntimeApiKey("openai", "openai-test-key");
+
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) =>
+				streamOpenAIResponses(requestedModel as Model<"openai-responses">, context, {
+					...options,
+					apiKey: "openai-test-key",
+					fetch: fetchMock,
+					providerRetryWait: async () => {},
+				}),
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+		});
+		sessions.push(session);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger stream truncation");
+		await session.waitForIdle();
+		await sessionManager.flush();
+
+		return { sessionManager, retryEndEvents };
 	}
 
 	it("marks a recovered retry error, emits it, persists it, and excludes only model-context replay", async () => {
@@ -332,6 +444,51 @@ describe("AgentSession retry recovery", () => {
 			text: terminalErrorText,
 			isError: true,
 		});
+	});
+
+	it("does not loop-retry an interactive text-only truncated turn the provider already retried", async () => {
+		const fetchMock = vi.fn(async () =>
+			truncatedTextSseResponse("Partial visible answer", "resp_truncated"),
+		) as FetchImpl;
+
+		const { sessionManager, retryEndEvents } = await runOpenAIResponsesTruncation(fetchMock);
+
+		// 1 initial attempt + 2 provider-internal transient-stream retries. The
+		// final attempt's partial text was forwarded, so the session must NOT
+		// replay the turn at the loop level.
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(retryEndEvents).toEqual([]);
+
+		const terminalError = assistantEntries(sessionManager).at(-1)?.message;
+		if (!terminalError) {
+			throw new Error("Expected a terminal assistant error entry");
+		}
+		expect(terminalError.stopReason).toBe("error");
+		expect(terminalError.errorMessage).toContain("closed before a terminal response event");
+		expect(JSON.stringify(terminalError.content)).toContain("Partial visible answer");
+		expect(terminalError.retryRecovery).toBeUndefined();
+	});
+
+	it("runs the auto_retry saga when an empty incomplete-stream error escapes the provider", async () => {
+		let call = 0;
+		const fetchMock = vi.fn(async () => {
+			call++;
+			if (call <= 3) return truncatedEmptySseResponse(`resp_truncated_${call}`);
+			return completedTextSseResponse("recovered after provider budget exhaustion", "resp_recovered");
+		}) as FetchImpl;
+
+		const { sessionManager, retryEndEvents } = await runOpenAIResponsesTruncation(fetchMock);
+
+		// 3 provider attempts (budget exhausted with nothing committed, so the
+		// error stays replay-safe) + 1 session-level auto-retry that succeeds.
+		expect(fetchMock).toHaveBeenCalledTimes(4);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+
+		const recoveredEntry = recoveredAssistantEntry(sessionManager);
+		expect(recoveredEntry.message.stopReason).toBe("error");
+		expect(recoveredEntry.message.content).toEqual([]);
+		successfulAssistantEntry(sessionManager, "recovered after provider budget exhaustion");
 	});
 
 	it("maps assistant error presentation for recovered, unrecovered, and silent abort turns", () => {
