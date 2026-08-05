@@ -160,8 +160,7 @@ export class RoutingStatsTracker {
 		this.#persistPath = options.persistPath;
 		this.#window = options.window ?? ROUTING_STATS_WINDOW;
 		this.#saveThrottleMs = options.saveThrottleMs ?? DEFAULT_SAVE_THROTTLE_MS;
-		this.#hydrated =
-			options.hydrate === false || !this.#persistPath ? Promise.resolve() : this.#hydrateFromDisk();
+		this.#hydrated = options.hydrate === false || !this.#persistPath ? Promise.resolve() : this.#hydrateFromDisk();
 	}
 
 	/** Resolved once the initial disk read (if any) settled. Await in tests. */
@@ -206,7 +205,10 @@ export class RoutingStatsTracker {
 	slowReason(slug: string, thresholds: SlowProviderThresholds): string | undefined {
 		const summary = this.getSummary(slug);
 		if (!summary || summary.turns < ROUTING_STATS_MIN_TURNS) return undefined;
-		if (summary.medianTokensPerSecond !== undefined && summary.medianTokensPerSecond < thresholds.minTokensPerSecond) {
+		if (
+			summary.medianTokensPerSecond !== undefined &&
+			summary.medianTokensPerSecond < thresholds.minTokensPerSecond
+		) {
 			return `${summary.medianTokensPerSecond.toFixed(1)} tok/s median`;
 		}
 		if (summary.ttftP50Ms !== undefined && summary.ttftP50Ms > thresholds.maxTtftMs) {
@@ -238,9 +240,7 @@ export class RoutingStatsTracker {
 		return {
 			slug,
 			turns: samples.length,
-			medianTokensPerSecond: median(
-				samples.map(s => s.tokensPerSecond).filter((v): v is number => v !== undefined),
-			),
+			medianTokensPerSecond: median(samples.map(s => s.tokensPerSecond).filter((v): v is number => v !== undefined)),
 			ttftP50Ms: median(samples.map(s => s.ttftMs).filter((v): v is number => v !== undefined)),
 		};
 	}
@@ -338,7 +338,11 @@ export function routingSampleFromMessage(
 export function isOpenRouterBackfillCandidate(message: RoutingMessageSlice): boolean {
 	if (message.stopReason === "aborted" || message.stopReason === "error") return false;
 	if (message.upstreamProvider) return false;
-	return message.provider === "openrouter" && typeof message.responseId === "string" && message.responseId.startsWith("gen-");
+	return (
+		message.provider === "openrouter" &&
+		typeof message.responseId === "string" &&
+		message.responseId.startsWith("gen-")
+	);
 }
 
 let defaultTracker: RoutingStatsTracker | undefined;

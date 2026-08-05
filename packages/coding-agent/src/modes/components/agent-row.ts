@@ -144,7 +144,10 @@ export function formatAgentRow(
 		const progress = observed?.progress;
 		if (progress?.currentTool) {
 			meta.push(
-				theme.fg("dim", truncateToWidth(replaceTabs(sanitizeText(progress.currentTool)), AGENT_ROW_CURRENT_TOOL_MAX)),
+				theme.fg(
+					"dim",
+					truncateToWidth(replaceTabs(sanitizeText(progress.currentTool)), AGENT_ROW_CURRENT_TOOL_MAX),
+				),
 			);
 		}
 		if (progress && progress.cost > 0) {

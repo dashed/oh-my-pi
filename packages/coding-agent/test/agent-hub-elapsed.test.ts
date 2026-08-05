@@ -183,7 +183,10 @@ describe("Agent hub running progress meta", () => {
 		setSystemTime(1_000_000);
 		agents.register({ id: "Worker", displayName: "Worker", kind: "sub", session: {} as AgentSession });
 		const longTool = `tool-${"x".repeat(60)}`;
-		const hub = makeHub(agents, observersWithProgress("Worker", { startedAtMs: 1_000_000, currentTool: longTool, cost: 0 }));
+		const hub = makeHub(
+			agents,
+			observersWithProgress("Worker", { startedAtMs: 1_000_000, currentTool: longTool, cost: 0 }),
+		);
 		try {
 			setSystemTime(1_000_000);
 			const row = rowFor(hub, "Worker");

@@ -752,7 +752,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		acpDescription: "OpenRouter upstream provider stats and bans",
 		acpInputHint: "[ignore|unignore <slug>]",
 		subcommands: [
-			{ name: "ignore", description: "Ban an OpenRouter upstream slug (persists providers.openrouter.ignore)", usage: "<slug>" },
+			{
+				name: "ignore",
+				description: "Ban an OpenRouter upstream slug (persists providers.openrouter.ignore)",
+				usage: "<slug>",
+			},
 			{ name: "unignore", description: "Remove an OpenRouter upstream ban", usage: "<slug>" },
 		],
 		allowArgs: true,

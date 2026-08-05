@@ -14,12 +14,12 @@
  * Everything time-derived (spinner glyph, gerund rotation, elapsed) is computed
  * at render time from the clock, so a bare requestRender repaints a fresh frame.
  */
-import { Text, truncateToWidth, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
+import { Text, type TUI, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { type ShimmerPalette, shimmerEnabled, shimmerText } from "../theme/shimmer";
 import { theme } from "../theme/theme";
 import { SpeedTracker } from "./speed-tracker";
-import { sharedSpinnerFrame, SPINNER_RENDER_INTERVAL_MS } from "./tool-execution";
+import { SPINNER_RENDER_INTERVAL_MS, sharedSpinnerFrame } from "./tool-execution";
 
 /** Session-accent ANSI pair resolved by the host (see InteractiveMode). */
 export interface WorkingMessageAccent {
@@ -115,7 +115,8 @@ export class WorkingIndicator extends Text {
 	constructor(ui: TUI, options: WorkingIndicatorOptions = {}) {
 		super("", 1, 0);
 		this.#ui = ui;
-		this.#frames = options.spinnerFrames && options.spinnerFrames.length > 0 ? options.spinnerFrames : DEFAULT_SPINNER_FRAMES;
+		this.#frames =
+			options.spinnerFrames && options.spinnerFrames.length > 0 ? options.spinnerFrames : DEFAULT_SPINNER_FRAMES;
 		this.#getAccent = options.getAccent;
 		this.#startMs = Date.now();
 		this.start();

@@ -384,7 +384,8 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 					// Shared "Reading src/foo.ts"-style activity label (same formatter
 					// the working indicator uses); unknown tools keep the raw name,
 					// control-stripped — tool names can come from MCP servers.
-					const activity = formatToolActivity(currentTool, session.progress?.currentToolArgs) ?? sanitizeText(currentTool);
+					const activity =
+						formatToolActivity(currentTool, session.progress?.currentToolArgs) ?? sanitizeText(currentTool);
 					line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(activity), TRUNCATE_LENGTHS.SHORT))}`;
 				}
 				return line;

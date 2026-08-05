@@ -193,10 +193,10 @@ export async function fetchOpenRouterGenerationProvider(
 ): Promise<string | undefined> {
 	const fetchImpl = options.fetchImpl ?? fetch;
 	try {
-		const response = await fetchImpl(
-			`${OPENROUTER_API_BASE}/generation?id=${encodeURIComponent(generationId)}`,
-			{ headers: { Accept: "application/json", Authorization: `Bearer ${options.apiKey}` }, signal: options.signal },
-		);
+		const response = await fetchImpl(`${OPENROUTER_API_BASE}/generation?id=${encodeURIComponent(generationId)}`, {
+			headers: { Accept: "application/json", Authorization: `Bearer ${options.apiKey}` },
+			signal: options.signal,
+		});
 		if (!response.ok) return undefined;
 		const json = (await response.json()) as Record<string, unknown>;
 		const data = typeof json.data === "object" && json.data !== null ? (json.data as Record<string, unknown>) : {};

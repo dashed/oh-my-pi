@@ -54,7 +54,12 @@ function createResponsesDoneResponse(): Response {
 				type: "response.completed",
 				response: {
 					status: "completed",
-					usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 } },
+					usage: {
+						input_tokens: 1,
+						output_tokens: 1,
+						total_tokens: 2,
+						input_tokens_details: { cached_tokens: 0 },
+					},
 				},
 			})}\n\n`,
 		{ status: 200, headers: { "content-type": "text/event-stream" } },

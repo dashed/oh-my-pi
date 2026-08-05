@@ -11,8 +11,8 @@ import {
 	buildRoutingTurnSample,
 	isOpenRouterBackfillCandidate,
 	ROUTING_STATS_WINDOW,
-	routingSampleFromMessage,
 	RoutingStatsTracker,
+	routingSampleFromMessage,
 	SlowProviderNotifier,
 } from "@oh-my-pi/pi-coding-agent/session/routing-stats";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -161,7 +161,7 @@ describe("RoutingStatsTracker persistence", () => {
 		const persisted = JSON.parse(await Bun.file(filePath).text()) as {
 			providers: Record<string, { samples: unknown[] }>;
 		};
-		expect(persisted.providers["anthropic"]?.samples).toHaveLength(1);
+		expect(persisted.providers.anthropic?.samples).toHaveLength(1);
 		tracker.dispose();
 	});
 
@@ -201,7 +201,9 @@ describe("RoutingStatsTracker persistence", () => {
 			JSON.stringify({
 				version: 1,
 				providers: {
-					anthropic: { samples: [{ tokensPerSecond: 5, ttftMs: 100 }, "garbage", { tokensPerSecond: Number.NaN }, 42] },
+					anthropic: {
+						samples: [{ tokensPerSecond: 5, ttftMs: 100 }, "garbage", { tokensPerSecond: Number.NaN }, 42],
+					},
 					empty: { samples: [] },
 					wrong: "shape",
 				},
@@ -242,7 +244,9 @@ describe("routingSampleFromMessage / backfill candidacy", () => {
 	});
 
 	it("skips turns with no usable signal", () => {
-		expect(routingSampleFromMessage({ ...baseMessage, usage: { output: 0 }, duration: 0, ttft: undefined })).toBeUndefined();
+		expect(
+			routingSampleFromMessage({ ...baseMessage, usage: { output: 0 }, duration: 0, ttft: undefined }),
+		).toBeUndefined();
 	});
 
 	it("marks gen-id OpenRouter turns without attribution as backfill candidates", () => {
@@ -254,7 +258,12 @@ describe("routingSampleFromMessage / backfill candidacy", () => {
 			isOpenRouterBackfillCandidate({ ...baseMessage, upstreamProvider: undefined, responseId: "chatcmpl-1" }),
 		).toBe(false);
 		expect(
-			isOpenRouterBackfillCandidate({ ...baseMessage, upstreamProvider: undefined, responseId: "gen-1", provider: "openai" }),
+			isOpenRouterBackfillCandidate({
+				...baseMessage,
+				upstreamProvider: undefined,
+				responseId: "gen-1",
+				provider: "openai",
+			}),
 		).toBe(false);
 	});
 });

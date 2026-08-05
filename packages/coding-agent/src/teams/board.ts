@@ -18,7 +18,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getConfigRootDir, isEexist, isRecord, logger, sanitizeText, Snowflake } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, isEexist, isRecord, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { AgentRegistry } from "../registry/agent-registry";
 
 // =============================================================================
@@ -201,7 +201,10 @@ export async function withTaskLock<T>(taskFilePath: string, fn: () => Promise<T>
 		return await fn();
 	} finally {
 		await handle.close().catch(() => {});
-		const stillOurs = await fs.readFile(lockPath, "utf8").then(content => content === token, () => false);
+		const stillOurs = await fs.readFile(lockPath, "utf8").then(
+			content => content === token,
+			() => false,
+		);
 		if (stillOurs) await fs.rm(lockPath, { force: true }).catch(() => {});
 	}
 }

@@ -64,14 +64,18 @@ describe("stripOpenRouterVariantSuffix", () => {
 	it("strips a variant suffix but leaves port-less ids and provider segments alone", () => {
 		expect(stripOpenRouterVariantSuffix("anthropic/claude-haiku-latest:nitro")).toBe("anthropic/claude-haiku-latest");
 		expect(stripOpenRouterVariantSuffix("anthropic/claude-haiku-latest")).toBe("anthropic/claude-haiku-latest");
-		expect(stripOpenRouterVariantSuffix("deepseek/deepseek-v3.1-terminus:exacto")).toBe("deepseek/deepseek-v3.1-terminus");
+		expect(stripOpenRouterVariantSuffix("deepseek/deepseek-v3.1-terminus:exacto")).toBe(
+			"deepseek/deepseek-v3.1-terminus",
+		);
 	});
 });
 
 describe("fetchOpenRouterEndpointPerf", () => {
 	it("parses per-endpoint p50 latency/throughput and uptime, tolerating nulls", async () => {
 		const fetchMock = vi.fn(async () => jsonResponse(endpointsFixture()));
-		const perf = await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4", { fetchImpl: fetchMock as unknown as typeof fetch });
+		const perf = await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+		});
 
 		expect(perf).toHaveLength(3);
 		expect(perf[0]).toEqual({
@@ -98,7 +102,9 @@ describe("fetchOpenRouterEndpointPerf", () => {
 			url = String(input);
 			return jsonResponse(endpointsFixture());
 		});
-		await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4:nitro", { fetchImpl: fetchMock as unknown as typeof fetch });
+		await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4:nitro", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+		});
 		expect(url).toBe("https://openrouter.ai/api/v1/models/anthropic/claude-sonnet-4/endpoints");
 	});
 
@@ -113,7 +119,9 @@ describe("fetchOpenRouterEndpointPerf", () => {
 		const fixture = endpointsFixture();
 		((fixture.data as Record<string, unknown>).endpoints as unknown[]).push({ provider_name: "Mystery" });
 		const fetchMock = vi.fn(async () => jsonResponse(fixture));
-		const perf = await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4", { fetchImpl: fetchMock as unknown as typeof fetch });
+		const perf = await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+		});
 		expect(perf).toHaveLength(3);
 	});
 });
@@ -166,7 +174,9 @@ describe("fetchOpenRouterGenerationProvider", () => {
 
 	it("falls back to provider_responses[0].provider_name", async () => {
 		const fetchMock = vi.fn(async () =>
-			jsonResponse({ data: { id: "gen-1", provider_responses: [{ provider_name: "Amazon Bedrock", status: 200 }] } }),
+			jsonResponse({
+				data: { id: "gen-1", provider_responses: [{ provider_name: "Amazon Bedrock", status: 200 }] },
+			}),
 		);
 		const provider = await fetchOpenRouterGenerationProvider("gen-1", {
 			apiKey: "test-key",

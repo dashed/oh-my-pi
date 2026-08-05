@@ -41,9 +41,7 @@ const ENDPOINTS_FIXTURE = {
 };
 
 function endpointsFetch(): typeof fetch {
-	return vi.fn(async () =>
-		Response.json(ENDPOINTS_FIXTURE),
-	) as unknown as typeof fetch;
+	return vi.fn(async () => Response.json(ENDPOINTS_FIXTURE)) as unknown as typeof fetch;
 }
 
 const openRouterModel = {

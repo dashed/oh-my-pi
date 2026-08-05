@@ -8,14 +8,15 @@
  * (openrouter-endpoint-stats.ts), fetched lazily here behind a short cache —
  * never per turn.
  */
+
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { AgentSession } from "../../session/agent-session";
 import {
 	type OpenRouterEndpointPerf,
-	OpenRouterEndpointStatsCache,
+	type OpenRouterEndpointStatsCache,
 	openRouterEndpointStatsCache,
 } from "../../session/openrouter-endpoint-stats";
-import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { getRoutingStatsTracker, type RoutingStatsTracker } from "../../session/routing-stats";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
 

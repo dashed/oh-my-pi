@@ -164,7 +164,16 @@ const TOOL_ACTIVITY_VERBS: Record<string, string> = {
 
 /** Arg keys carrying the most recognizable per-tool target, in priority order
  *  (mirrors the task executor's progress-preview key order). */
-const TOOL_ACTIVITY_DETAIL_KEYS = ["command", "file_path", "path", "pattern", "query", "url", "task", "prompt"] as const;
+const TOOL_ACTIVITY_DETAIL_KEYS = [
+	"command",
+	"file_path",
+	"path",
+	"pattern",
+	"query",
+	"url",
+	"task",
+	"prompt",
+] as const;
 
 /**
  * One-line "Reading src/foo.ts"-style label for a tool currently in flight, or
