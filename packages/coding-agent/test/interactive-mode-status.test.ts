@@ -158,3 +158,27 @@ describe("InteractiveMode.showStatus", () => {
 		expect(ctx.optimisticUserMessageSignature).toBe("hello\u00001");
 	});
 });
+
+describe("showWarning coalescing", () => {
+	test("coalesces consecutive identical warnings into one row with a repeat count", async () => {
+		await initTheme();
+		const { ctx } = createInitialRenderHarness();
+		const helpers = new UiHelpers(ctx);
+		helpers.showWarning("Todo update failed: stalled");
+		helpers.showWarning("Todo update failed: stalled");
+		helpers.showWarning("Todo update failed: stalled");
+		const texts = ctx.chatContainer.children.filter((c): c is Text => c instanceof Text);
+		expect(texts).toHaveLength(1);
+		expect(renderContainer(ctx.chatContainer)).toContain("Warning: Todo update failed: stalled (×3)");
+	});
+
+	test("appends a fresh row when the message differs", async () => {
+		await initTheme();
+		const { ctx } = createInitialRenderHarness();
+		const helpers = new UiHelpers(ctx);
+		helpers.showWarning("first");
+		helpers.showWarning("second");
+		const texts = ctx.chatContainer.children.filter((c): c is Text => c instanceof Text);
+		expect(texts).toHaveLength(2);
+	});
+});

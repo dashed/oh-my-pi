@@ -286,17 +286,6 @@ function buildAdvisorQuarantineRetryInstruction(grantedToolNames: readonly strin
 	return `\n\n[ADVISOR TOOLING CONSTRAINT — one-shot] ${constraint} Deliver advice only through the advise tool.`;
 }
 
-/** Whether the turn's messages contain a call to the granted `advise` tool. */
-function messagesContainAdviseCall(messages: readonly AgentMessage[]): boolean {
-	return messages.some(
-		message =>
-			message.role === "assistant" &&
-			message.content.some(
-				block => block.type === "toolCall" && block.name === "advise" && typeof block.arguments.note === "string",
-			),
-	);
-}
-
 const ADVISOR_RENDER_OPTIONS = {
 	includeToolIntent: true,
 	watchedRoles: true,
@@ -360,15 +349,6 @@ export class AdvisorRuntime {
 	#backlog = 0;
 	#consecutiveFailures = 0;
 	#failureNotified = false;
-	/**
-	 * True while the outstanding failure notice came from the quarantine halt.
-	 * Such a notice re-arms ONLY on explicit reset/seed or when the advisor
-	 * actually delivers advice — never on a silent/advice-less success — so one
-	 * persistently-quarantining model warns once per session instead of
-	 * re-warning after every quiet turn. Notices from other failure paths keep
-	 * the legacy re-arm-on-any-success behavior.
-	 */
-	#quarantineNoticeActive = false;
 	/** Consecutive quarantined turns since the last success/reset (issue #6661). */
 	#consecutiveQuarantines = 0;
 	/** Whether primary reasoning is included in advisor deltas for the current model. */

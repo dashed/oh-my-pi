@@ -24,6 +24,7 @@ import {
 import { getKnownRoleIds } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import { containsUltrathink } from "../modes/ultrathink";
+import { resolveSwarmConfig, swarmCallerBudgetMs } from "../swarm/ensemble";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -601,7 +602,17 @@ export class ModelControls {
 			resolved = clampAutoThinkingEffort(model, Effort.Max);
 		} else {
 			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), ModelControls.#AUTO_THINKING_TIMEOUT_MS);
+			// The 4s legacy budget is sized for one reasoning-disabled 2048-token
+			// call. With the swarm enabled, members reason at full effort
+			// (observed latency is stochastic, up to ~19s), so the caller budget
+			// must cover the member phase plus the one-call fallback phase —
+			// otherwise the external abort lands pre-quorum and the fallback
+			// runs on an already-aborted signal (mirrors turn-recovery).
+			const swarm = resolveSwarmConfig(this.#host.settings, "autoThinking");
+			const timer = setTimeout(
+				() => controller.abort(),
+				swarm.enabled ? swarmCallerBudgetMs(swarm) : ModelControls.#AUTO_THINKING_TIMEOUT_MS,
+			);
 			try {
 				resolved = await classifyDifficulty(promptText, {
 					settings: this.#host.settings,

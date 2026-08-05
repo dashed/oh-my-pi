@@ -91,6 +91,9 @@ function imageLinksForMessage(
 }
 
 export class UiHelpers {
+	#lastWarningMessage: string | undefined = undefined;
+	#lastWarningCount = 0;
+
 	constructor(private ctx: InteractiveModeContext) {}
 
 	/** Extract text content from a user message */
@@ -734,9 +737,40 @@ export class UiHelpers {
 		this.ctx.present([new Spacer(1), text]);
 	}
 
+	/**
+	 * Show a warning message in the chat.
+	 *
+	 * Identical warnings emitted back-to-back (without anything else being added
+	 * to the chat in between) update the previous warning row with a repeat
+	 * count instead of appending new ones — a stalled turn whose N unexecuted
+	 * todo calls each fail would otherwise spam N identical rows. Mirrors the
+	 * showStatus coalescing precedent above.
+	 */
 	showWarning(warningMessage: string): void {
+		const children = this.ctx.chatContainer.children;
+		const last = children.length > 0 ? children[children.length - 1] : undefined;
+		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
+
+		if (
+			last &&
+			secondLast &&
+			last === this.ctx.lastWarningText &&
+			secondLast === this.ctx.lastWarningSpacer &&
+			this.#lastWarningMessage === warningMessage
+		) {
+			this.#lastWarningCount += 1;
+			this.ctx.lastWarningText.setText(`Warning: ${warningMessage} (×${this.#lastWarningCount})`);
+			this.ctx.ui.requestRender();
+			return;
+		}
+
+		const spacer = new Spacer(1);
 		const text = new Text(`Warning: ${warningMessage}`, 1, 0).setStyleFn(t => theme.fg("warning", t));
-		this.ctx.present([new Spacer(1), text]);
+		this.ctx.present([spacer, text]);
+		this.ctx.lastWarningSpacer = spacer;
+		this.ctx.lastWarningText = text;
+		this.#lastWarningMessage = warningMessage;
+		this.#lastWarningCount = 1;
 	}
 
 	showNewVersionNotification(newVersion: string): void {

@@ -224,6 +224,8 @@ export interface InteractiveModeContext {
 	hookEditor: HookEditorComponent | undefined;
 	lastStatusSpacer: Spacer | undefined;
 	lastStatusText: Text | undefined;
+	lastWarningSpacer: Spacer | undefined;
+	lastWarningText: Text | undefined;
 	fileSlashCommands: Set<string>;
 	skillCommands: Map<string, Skill>;
 	oauthManualInput: OAuthManualInputManager;
