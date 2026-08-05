@@ -89,6 +89,7 @@ import {
 	MCP_CONNECTION_STATUS_EVENT_CHANNEL,
 	type McpConnectionStatusEvent,
 } from "../mcp/startup-events";
+import { setActiveTeamObserver, TeamObserver } from "../observer/team-observer";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
@@ -624,6 +625,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#voicePreviousUseTerminalCursor: boolean | null = null;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
+	#teamObserver?: TeamObserver;
 	readonly #agentPanel: AgentPanelComponent;
 	#agentPanelRegistryUnsubscribe?: () => void;
 	#agentPanelRegistryTarget?: AgentRegistry;
@@ -1011,6 +1013,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#observerRegistry.onChange(kind => {
 			this.#scheduleObserverUiSync(kind);
 		});
+		// Team observer: process-level, lead-independent pathology monitor
+		// (stuck/error-looping/stalled agents, board deadlocks, runaway spend).
+		// Consumes the shared observer registry feed; notices only — it never
+		// kills, parks, or mutates the board.
+		this.#teamObserver = new TeamObserver({
+			observers: this.#observerRegistry,
+			showStatus: message => this.showStatus(message, { dim: true }),
+		});
+		this.#teamObserver.start();
+		setActiveTeamObserver(this.#teamObserver);
 		// Establishes the panel's badge-registry subscription and renders its
 		// initial (normally empty) state; later updates arrive via the observer
 		// flush and that subscription.
@@ -4143,6 +4155,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			unsubscribe();
 		}
 		this.#eventBusUnsubscribers = [];
+		setActiveTeamObserver(undefined);
+		this.#teamObserver?.dispose();
+		this.#teamObserver = undefined;
 		this.#observerRegistry.dispose();
 		this.#agentPanel.dispose();
 		this.#agentPanelRegistryUnsubscribe?.();

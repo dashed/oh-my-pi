@@ -4673,6 +4673,111 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"observer.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Team Observer",
+			description:
+				"Deterministic, lead-independent team health monitor: flags stuck or error-looping agents, parked workers ignoring claimable board tasks, board deadlocks, cost/token runaways, and orphaned agents via dim status notices and OS notifications. Read-only — it never kills, parks, or mutates the board; the notices name the manual fix.",
+		},
+	},
+
+	"observer.boardPollMs": {
+		type: "number",
+		default: 5000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer Board Poll Interval",
+			description: "How often the team observer polls the shared team board and rescans agent health (ms).",
+		},
+	},
+
+	"observer.stuckThresholdMs": {
+		type: "number",
+		default: 180_000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer Stuck Threshold",
+			description:
+				"How long a running subagent may go without any activity before the team observer flags it as stuck (ms). Agents sleeping between provider retries are never flagged.",
+		},
+	},
+
+	"observer.stallIdleMs": {
+		type: "number",
+		default: 120_000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer Stall Idle Threshold",
+			description:
+				"How long workers may sit idle/parked while claimable board work waits before the team observer flags the stall (ms).",
+		},
+	},
+
+	"observer.errorLoopMaxFailures": {
+		type: "number",
+		default: 3,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer Error-Loop Failures",
+			description: "How many terminal failures for one agent id inside the error-loop window trigger a flag.",
+		},
+	},
+
+	"observer.errorLoopWindowMs": {
+		type: "number",
+		default: 600_000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer Error-Loop Window",
+			description: "Sliding window (ms) the team observer counts subagent failures over for error-loop detection.",
+		},
+	},
+
+	"observer.maxCostPerRunUsd": {
+		type: "number",
+		default: 5,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer Max Cost Per Run",
+			description:
+				"Cumulative per-run cost (USD) above which the team observer flags a runaway subagent. Killing it stays manual via the Agent Hub.",
+		},
+	},
+
+	"observer.maxTokensPerRun": {
+		type: "number",
+		default: 2_000_000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer Max Tokens Per Run",
+			description:
+				"Cumulative per-run token count above which the team observer flags a runaway subagent. Killing it stays manual via the Agent Hub.",
+		},
+	},
+
+	"observer.nudgeEnabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Observer DM Nudges",
+			description:
+				"Allow the team observer to send one DM nudge to a stalled agent (wakes idle, revives parked). Off = status notices and OS notifications only.",
+		},
+	},
+
 	"task.softRequestBudget": {
 		type: "number",
 		default: 200,

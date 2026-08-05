@@ -15,10 +15,11 @@
  */
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { Container, Ellipsis, matchesKey, type OverlayHandle, type TUI } from "@oh-my-pi/pi-tui";
-import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { getProjectDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { IrcBus } from "../../irc/bus";
+import { getActiveTeamObserver } from "../../observer/team-observer";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
@@ -350,12 +351,26 @@ export class AgentHubOverlayComponent extends Container {
 		lines.push(` ${theme.fg("accent", "Agent Hub")}${counts ? theme.fg("dim", `${theme.sep.dot}${counts}`) : ""}`);
 		lines.push(...new DynamicBorder().render(width));
 
+		// Read-only TeamObserver flags (agent id + pathology + the manual fix).
+		const observerFlags = getActiveTeamObserver()?.getActiveFlags() ?? [];
+		if (observerFlags.length > 0) {
+			lines.push(
+				` ${theme.fg("warning", "Observer")} ${theme.fg("dim", `${observerFlags.length} active flag${observerFlags.length === 1 ? "" : "s"}`)}`,
+			);
+			for (const flag of observerFlags.slice(0, 3)) {
+				lines.push(
+					`   ${theme.fg("warning", "⚠")} ${theme.fg("dim", sanitizeLine(sanitizeText(`${flag.subjectId}: ${flag.summary} · fix: ${flag.fix}`), Math.max(10, width - 6)))}`,
+				);
+			}
+		}
+
 		if (this.#rows.length === 0) {
 			lines.push(` ${theme.fg("dim", "no subagents yet — task spawns appear here")}`);
 		} else {
 			const termHeight = process.stdout.rows || 40;
-			// Chrome: 2 borders + title + notice? + blank + hints + border
-			const budget = Math.max(4, termHeight - 7 - (this.#notice ? 1 : 0));
+			// Chrome: 2 borders + title + observer flags? + notice? + blank + hints + border
+			const observerLines = observerFlags.length > 0 ? 1 + Math.min(observerFlags.length, 3) : 0;
+			const budget = Math.max(4, termHeight - 7 - (this.#notice ? 1 : 0) - observerLines);
 			// Render outward from the selection and stop once the viewport is full.
 			// Cache rendered entries so a boundary probe is not paid twice when the
 			// same index is later accepted into the window.
