@@ -120,7 +120,7 @@ function clampInt(value: number, min: number, max: number): number {
  * ladder (catalog `thinking.efforts` order is not guaranteed ascending).
  * Undefined when the model has no controllable effort surface.
  */
-function highestSupportedEffort(model: Model<Api>): Effort | undefined {
+export function highestSupportedEffort(model: Model<Api>): Effort | undefined {
 	let best: Effort | undefined;
 	let bestRank = -1;
 	for (const effort of getSupportedEfforts(model)) {
@@ -387,7 +387,7 @@ function ensembleAbortError(externalSignal: AbortSignal): Error {
  * the {@link swarmCallerBudgetMs} budget) plus external-abort forwarding.
  * `dispose` clears the timer and detaches the forwarder.
  */
-function createPhaseSignal(
+export function createPhaseSignal(
 	timeoutMs: number,
 	externalSignal: AbortSignal | undefined,
 ): { signal: AbortSignal; dispose: () => void } {

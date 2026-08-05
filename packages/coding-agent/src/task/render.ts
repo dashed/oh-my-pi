@@ -1552,9 +1552,17 @@ export function renderResult(
 	const icon: ToolUIStatus = options.isPartial ? "running" : isError ? "error" : mergeFailed ? "warning" : "success";
 	// Header meta is the spawn count only; each row carries its own ⟨agent⟩
 	// badge, so a joined type list here would repeat them. Before anything
-	// spawns, fall back to the flat form's agent type from the call args.
+	// spawns, fall back to the flat form's agent type from the call args. A
+	// swarm run instead shows the fan-out badge: quorum/members once settled
+	// (with the synthesis mode), `swarm ×N` while members are in flight.
 	const countLabel = agentCount > 0 ? `${agentCount} ${agentCount === 1 ? "agent" : "agents"}` : undefined;
-	const metaLabel = countLabel ?? agentLabel;
+	const swarm = details.swarm;
+	const swarmLabel = swarm
+		? swarm.synthesis !== undefined
+			? `swarm ${swarm.memberResults.filter(member => member.counted).length}/${swarm.members} · ${swarm.synthesis}`
+			: `swarm ×${swarm.members}`
+		: undefined;
+	const metaLabel = swarmLabel ?? countLabel ?? agentLabel;
 	const header = renderStatusLine(
 		{
 			icon: icon === "success" || icon === "running" ? undefined : icon,

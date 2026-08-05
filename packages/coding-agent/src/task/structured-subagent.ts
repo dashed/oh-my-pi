@@ -100,6 +100,12 @@ export interface StructuredSubagentRequest {
 	isolation?: StructuredSubagentIsolationControls;
 	/** The parent agent name forbidden from recursively spawning itself. */
 	blockedAgent?: string;
+	/**
+	 * Agent types the spawned session may NOT spawn itself, merged into the
+	 * child's `task.disabledAgents` on top of the inherited value. The swarm
+	 * fan-out uses this to bar members from spawning swarms of their own.
+	 */
+	disableAgents?: string[];
 	/** Preserve a completed temporary artifacts directory for an agent:// handle. */
 	retainArtifacts?: boolean;
 	/** Task UI agents keep live registry references; eval one-shots normally do not. */
@@ -410,6 +416,7 @@ function buildExecutorOptions(
 		artifactsDir: lease.artifactsDir,
 		enableLsp: policy.enableLsp,
 		enableIrc: policy.enableIrc,
+		disableAgents: request.disableAgents,
 		maxRuntimeMs: request.maxRuntimeMs,
 		restrictToolNames,
 		keepAlive: request.keepAlive,

@@ -331,6 +331,47 @@ export function canSpawnAtDepth(maxRecursionDepth: number, taskDepth: number): b
 	return maxRecursionDepth < 0 || taskDepth < maxRecursionDepth;
 }
 
+/** Zeroed {@link Usage} accumulator for cross-spawn aggregation. */
+export function createUsageTotals(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+/** Add a (possibly partial) usage record into a running total, in place. */
+export function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
+	const input = usage.input ?? 0;
+	const output = usage.output ?? 0;
+	const cacheRead = usage.cacheRead ?? 0;
+	const cacheWrite = usage.cacheWrite ?? 0;
+	const totalTokens = usage.totalTokens ?? input + output + cacheRead + cacheWrite;
+	const cost =
+		usage.cost ??
+		({
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0,
+		} satisfies Usage["cost"]);
+
+	target.input += input;
+	target.output += output;
+	target.cacheRead += cacheRead;
+	target.cacheWrite += cacheWrite;
+	target.totalTokens += totalTokens;
+	target.cost.input += cost.input;
+	target.cost.output += cost.output;
+	target.cost.cacheRead += cost.cacheRead;
+	target.cost.cacheWrite += cost.cacheWrite;
+	target.cost.total += cost.total;
+}
+
 /** A code review finding reported by the reviewer agent */
 export interface ReviewFinding {
 	title: string;
@@ -540,6 +581,32 @@ export interface SingleResult {
 	outputMeta?: { lineCount: number; charCount: number };
 }
 
+/** Terminal status of one swarm member in {@link SwarmMemberSummary}. */
+export type SwarmMemberStatus = "completed" | "failed" | "cancelled";
+
+/** Per-member rollup for a swarm run (task row badge + details JSON). */
+export interface SwarmMemberSummary {
+	id: string;
+	status: SwarmMemberStatus;
+	durationMs: number;
+	/** True when this member's output fed the final synthesis (merge candidates, earliest-member pick, or the fallback spawn). */
+	counted: boolean;
+}
+
+/** How a swarm run produced its final output. */
+export type SwarmSynthesis = "merge" | "earliest" | "fallback" | "aborted";
+
+/** Aggregate view of one swarm fan-out, attached to {@link TaskToolDetails}. */
+export interface SwarmRunSummary {
+	/** Members launched. */
+	members: number;
+	/** Successful member completions required to proceed to synthesis. */
+	quorum: number;
+	/** Undefined while the run is still in flight (live progress snapshots). */
+	synthesis?: SwarmSynthesis;
+	memberResults: SwarmMemberSummary[];
+}
+
 /** Tool details for TUI rendering */
 export interface TaskToolDetails {
 	projectAgentsDir: string | null;
@@ -549,6 +616,8 @@ export interface TaskToolDetails {
 	usage?: Usage;
 	outputPaths?: string[];
 	progress?: AgentProgress[];
+	/** Present when the spawn ran as a swarm fan-out (agent: "swarm"). */
+	swarm?: SwarmRunSummary;
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;

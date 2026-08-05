@@ -72,6 +72,22 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 		},
 		template: taskMd,
 	},
+	{
+		fileName: "swarm.md",
+		frontmatter: {
+			name: "swarm",
+			description:
+				"Swarm of parallel full-strength task agents on the SAME assignment; first quorum of completions is merge-synthesized into one result",
+			model: "@task",
+			thinkingLevel: AUTO_THINKING,
+			// The parent waits on the merged result: the fan-out, quorum wait,
+			// and synthesis all run inline inside this tool call.
+			blocking: true,
+		},
+		// Never runs a session of its own — the task tool intercepts the spawn
+		// and fans out N `task` members. The template only satisfies parsing.
+		template: taskMd,
+	},
 ];
 
 // Computed lazily on first loadBundledAgents() call to avoid eager prompt.render at module load.

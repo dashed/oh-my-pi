@@ -5344,6 +5344,9 @@ export const SETTINGS_SCHEMA = {
 	"swarm.members": { type: "number", default: 3 },
 	"swarm.quorum": { type: "number", default: 2 },
 	"swarm.timeoutMs": { type: "number", default: 15_000 },
+	// Task-swarm (`agent: "swarm"`) overrides; 0 inherits the swarm.* knobs above.
+	"task.swarmMembers": { type: "number", default: 0 },
+	"task.swarmQuorum": { type: "number", default: 0 },
 
 	"providers.kimiApiFormat": {
 		type: "enum",

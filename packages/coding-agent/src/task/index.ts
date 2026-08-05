@@ -31,7 +31,9 @@ import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	addUsageTotals,
 	canSpawnAtDepth,
+	createUsageTotals,
 	getTaskSchema,
 	type SingleResult,
 	type TaskItem,
@@ -51,50 +53,12 @@ import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
 import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
+import { resolveSwarmAgentShape, runSwarmAgent, SWARM_AGENT_NAME } from "./swarm-agent";
 
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
 		assignment: assignment.trim(),
 	});
-}
-
-function createUsageTotals(): Usage {
-	return {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-}
-
-function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
-	const input = usage.input ?? 0;
-	const output = usage.output ?? 0;
-	const cacheRead = usage.cacheRead ?? 0;
-	const cacheWrite = usage.cacheWrite ?? 0;
-	const totalTokens = usage.totalTokens ?? input + output + cacheRead + cacheWrite;
-	const cost =
-		usage.cost ??
-		({
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			total: 0,
-		} satisfies Usage["cost"]);
-
-	target.input += input;
-	target.output += output;
-	target.cacheRead += cacheRead;
-	target.cacheWrite += cacheWrite;
-	target.totalTokens += totalTokens;
-	target.cost.input += cost.input;
-	target.cost.output += cost.output;
-	target.cost.cacheRead += cost.cacheRead;
-	target.cost.cacheWrite += cost.cacheWrite;
-	target.cost.total += cost.total;
 }
 
 // Re-export types and utilities
@@ -109,6 +73,9 @@ export type {
 	SubagentEventPayload,
 	SubagentLifecyclePayload,
 	SubagentProgressPayload,
+	SwarmMemberSummary,
+	SwarmRunSummary,
+	SwarmSynthesis,
 	TaskParams,
 	TaskToolDetails,
 } from "./types";
@@ -1417,6 +1384,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
 		const context = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
+		if (params.agent?.trim() === SWARM_AGENT_NAME) {
+			return this.#runSwarmSpawn(
+				toolCallId,
+				params,
+				assignment,
+				context,
+				signal,
+				onUpdate,
+				preAllocatedId,
+				spawnIndex,
+				detached,
+				launchTiming,
+				startTime,
+			);
+		}
 		let latestProgress: AgentProgress | undefined;
 		try {
 			const execution = await runStructuredSubagent({
@@ -1469,6 +1451,82 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					totalDurationMs: Date.now() - startTime,
 					...(latestProgress ? { progress: [latestProgress] } : {}),
 				},
+			};
+		}
+	}
+
+	/**
+	 * `agent: "swarm"`: fan the assignment out to N full-strength members of the
+	 * session's default worker agent, synthesize the first quorum into one
+	 * result. Members bypass the spawn semaphore — the swarm spawn itself holds
+	 * one permit, and the fan-out is the point of the mode (bounding members
+	 * would self-deadlock at `task.maxConcurrency: 1`). Live updates carry every
+	 * member's progress row plus the running swarm summary.
+	 */
+	async #runSwarmSpawn(
+		toolCallId: string,
+		params: TaskParams,
+		assignment: string,
+		context: string | undefined,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TaskToolDetails> | undefined,
+		preAllocatedId: string | undefined,
+		spawnIndex: number,
+		detached: boolean,
+		launchTiming: { invokedAt: number; acquiredAt: number } | undefined,
+		startTime: number,
+	): Promise<AgentToolResult<TaskToolDetails>> {
+		const memberProgress = new Map<number, AgentProgress>();
+		const shape = resolveSwarmAgentShape(this.session);
+		const emit = (): void => {
+			onUpdate?.({
+				content: [{ type: "text", text: `Running swarm of ${shape.members} agents...` }],
+				details: {
+					projectAgentsDir: null,
+					results: [],
+					totalDurationMs: Date.now() - startTime,
+					progress: [...memberProgress.entries()].sort((a, b) => a[0] - b[0]).map(([, progress]) => progress),
+					swarm: { members: shape.members, quorum: shape.quorum, memberResults: [] },
+				},
+			});
+		};
+		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
+		try {
+			const outcome = await runSwarmAgent({
+				session: this.session,
+				assignment,
+				context,
+				// A pathological `defaultAgent: swarm` would recurse — pin members to
+				// the generic worker instead.
+				memberAgent: defaultAgent === SWARM_AGENT_NAME ? "task" : defaultAgent,
+				swarmAgentSource:
+					this.#discoveredAgents.find(agent => agent.name === SWARM_AGENT_NAME)?.source ?? "bundled",
+				...(params.effort !== undefined ? { effort: params.effort } : {}),
+				swarmId: preAllocatedId,
+				label: params.name,
+				index: spawnIndex,
+				parentToolCallId: toolCallId,
+				detached,
+				invokedAt: launchTiming?.invokedAt,
+				acquiredAt: launchTiming?.acquiredAt,
+				blockedAgent: this.#blockedAgent,
+				enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
+				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+				maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
+				signal,
+				onMemberProgress: progress => {
+					memberProgress.set(progress.index, progress);
+					emit();
+				},
+			});
+			const payload = this.#buildResultPayload(outcome.result, outcome.projectAgentsDir, Date.now() - startTime, "");
+			const details = payload.details ?? { projectAgentsDir: null, results: [], totalDurationMs: 0 };
+			return { ...payload, details: { ...details, swarm: outcome.swarm } };
+		} catch (error) {
+			const message = error instanceof StructuredSubagentError ? error.message : String(error);
+			return {
+				content: [{ type: "text", text: `Task execution failed: ${message}` }],
+				details: { projectAgentsDir: null, results: [], totalDurationMs: Date.now() - startTime },
 			};
 		}
 	}

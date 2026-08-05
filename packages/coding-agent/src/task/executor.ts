@@ -376,6 +376,12 @@ export interface ExecutorOptions {
 	enableIrc?: boolean;
 	enableLsp?: boolean;
 	/**
+	 * Agent types this child session may NOT spawn, merged into its
+	 * `task.disabledAgents` on top of the inherited value. Swarm members get
+	 * `[swarm]` so a swarm never nests another swarm.
+	 */
+	disableAgents?: string[];
+	/**
 	 * Enable MCP capabilities for this child. `false` suppresses both inherited
 	 * MCP proxy tools and session MCP discovery; it never consults the
 	 * process-global MCP manager. Defaults to `true`.
@@ -2610,6 +2616,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 			// Isolated runs must not expose roots outside the worktree.
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
+			// Caller-barred agent types (e.g. swarm members may not spawn swarms)
+			// ride the child's regular disabledAgents channel.
+			...(options.disableAgents?.length
+				? {
+						"task.disabledAgents": [
+							...new Set([...(settings.get("task.disabledAgents") as string[]), ...options.disableAgents]),
+						],
+					}
+				: undefined),
 		},
 		options.parentServiceTier,
 	);
