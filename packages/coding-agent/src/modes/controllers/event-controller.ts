@@ -1,5 +1,6 @@
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { sanitizeUpstreamProvider } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
 import { logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
@@ -1363,13 +1364,15 @@ export class EventController {
 	}
 
 	/**
-	 * Resolve a turn's serving upstream slug via the account-scoped generation
+	 * Resolve a turn's serving upstream via the account-scoped generation
 	 * endpoint. The generation endpoint reports a display name ("Amazon
 	 * Bedrock"); stats and bans key on endpoint tags ("amazon-bedrock"), so
-	 * map before recording. Returns `undefined` on any failure — backfill is
-	 * best-effort and must never break a turn.
+	 * map before recording — both are returned: the tag keys the stats, the
+	 * (sanitized) display name back-fills the message the way a mid-stream
+	 * `provider` field would have. Returns `undefined` on any failure —
+	 * backfill is best-effort and must never break a turn.
 	 */
-	async #resolveBackfillSlug(message: AssistantMessage): Promise<string | undefined> {
+	async #resolveBackfillSlug(message: AssistantMessage): Promise<{ tag: string; providerName: string } | undefined> {
 		const generationId = message.responseId;
 		if (!generationId) return undefined;
 		try {
@@ -1382,16 +1385,29 @@ export class EventController {
 			if (!providerName) return undefined;
 			const modelId = this.ctx.session.model?.id;
 			if (!modelId) return undefined;
-			return await resolveOpenRouterGenerationTag(modelId, providerName);
+			const tag = await resolveOpenRouterGenerationTag(modelId, providerName);
+			return tag ? { tag, providerName } : undefined;
 		} catch (error) {
 			logger.debug("OpenRouter upstream attribution backfill failed", { error: String(error) });
 			return undefined;
 		}
 	}
 
+	/**
+	 * Surface a backfilled attribution the way a mid-stream `provider` field
+	 * would have landed: on the message (telemetry, session log) and, while
+	 * the agent keeps working, on the live indicator's `via …` segment. The
+	 * display name is network-controlled, so it goes through the same charset
+	 * filter as the transport-side adoption.
+	 */
+	#adoptBackfilledUpstream(message: AssistantMessage, providerName: string): void {
+		message.upstreamProvider ??= sanitizeUpstreamProvider(providerName);
+		if (message.upstreamProvider) this.ctx.loadingAnimation?.recordUsage(0, message.upstreamProvider);
+	}
+
 	async #backfillUpstreamAttribution(message: AssistantMessage): Promise<void> {
-		const slug = await this.#resolveBackfillSlug(message);
-		if (!slug) return;
+		const attribution = await this.#resolveBackfillSlug(message);
+		if (!attribution) return;
 		const sample = buildRoutingTurnSample({
 			outputTokens: message.usage.output,
 			durationMs: message.duration,
@@ -1399,20 +1415,22 @@ export class EventController {
 		});
 		if (!sample) return;
 		const tracker = getRoutingStatsTracker();
-		tracker.record(slug, sample);
-		this.#notifyIfSlow(tracker, slug);
+		tracker.record(attribution.tag, sample);
+		this.#adoptBackfilledUpstream(message, attribution.providerName);
+		this.#notifyIfSlow(tracker, attribution.tag);
 	}
 
 	/** Errored-turn backfill: unresolved attribution lands in the unknown bucket. */
 	async #backfillUpstreamErrorAttribution(message: AssistantMessage, errorClass: RoutingErrorClass): Promise<void> {
-		const slug = await this.#resolveBackfillSlug(message);
+		const attribution = await this.#resolveBackfillSlug(message);
 		const tracker = getRoutingStatsTracker();
-		if (!slug) {
+		if (!attribution) {
 			tracker.recordError(UNKNOWN_PROVIDER_SLUG, errorClass);
 			return;
 		}
-		tracker.recordError(slug, errorClass);
-		this.#notifyIfFlaky(tracker, slug);
+		message.upstreamProvider ??= sanitizeUpstreamProvider(attribution.providerName);
+		tracker.recordError(attribution.tag, errorClass);
+		this.#notifyIfFlaky(tracker, attribution.tag);
 	}
 
 	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {

@@ -182,6 +182,35 @@ export async function resolveOpenRouterGenerationTag(
 }
 
 /**
+ * The generation record is eventually consistent: it 404s while the turn is
+ * still streaming and for a short window after stream end (observed ~1–2s
+ * live, 2026-08), so a single attempt fired at message_end loses the race and
+ * attribution silently never lands. Retry only the 404 with a bounded linear
+ * backoff; every other failure stays single-shot. The whole backfill runs
+ * detached from the turn, so the added latency never blocks the session.
+ */
+const GENERATION_NOT_FOUND_RETRY_ATTEMPTS = 5;
+const GENERATION_NOT_FOUND_RETRY_BASE_DELAY_MS = 500;
+
+/** Resolve `false` when `signal` aborts before `ms` elapse. */
+function waitForRetryDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
+	if (ms <= 0) return Promise.resolve(!signal?.aborted);
+	if (signal?.aborted) return Promise.resolve(false);
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const onAbort = () => {
+		clearTimeout(timer);
+		resolve(false);
+	};
+	const timer = setTimeout(() => {
+		signal?.removeEventListener("abort", onAbort);
+		resolve(true);
+	}, ms);
+	timer.unref?.();
+	signal?.addEventListener("abort", onAbort, { once: true });
+	return promise;
+}
+
+/**
  * Authoritative upstream attribution for one generation, via the
  * account-scoped generation endpoint. Returns the provider display name
  * (e.g. "DigitalOcean") or `undefined` on any failure — backfill is
@@ -189,27 +218,40 @@ export async function resolveOpenRouterGenerationTag(
  */
 export async function fetchOpenRouterGenerationProvider(
 	generationId: string,
-	options: OpenRouterFetchOptions & { apiKey: string },
+	options: OpenRouterFetchOptions & {
+		apiKey: string;
+		/** 404-retry tuning for the eventually-consistent record; defaults cover the observed post-turn lag. */
+		notFoundRetry?: { attempts?: number; baseDelayMs?: number };
+	},
 ): Promise<string | undefined> {
 	const fetchImpl = options.fetchImpl ?? fetch;
-	try {
-		const response = await fetchImpl(`${OPENROUTER_API_BASE}/generation?id=${encodeURIComponent(generationId)}`, {
-			headers: { Accept: "application/json", Authorization: `Bearer ${options.apiKey}` },
-			signal: options.signal,
-		});
-		if (!response.ok) return undefined;
-		const json = (await response.json()) as Record<string, unknown>;
-		const data = typeof json.data === "object" && json.data !== null ? (json.data as Record<string, unknown>) : {};
-		if (typeof data.provider_name === "string" && data.provider_name.length > 0) return data.provider_name;
-		const providerResponses = Array.isArray(data.provider_responses) ? data.provider_responses : [];
-		for (const entry of providerResponses) {
-			if (typeof entry !== "object" || entry === null) continue;
-			const name = (entry as Record<string, unknown>).provider_name;
-			if (typeof name === "string" && name.length > 0) return name;
+	const maxAttempts = Math.max(1, Math.floor(options.notFoundRetry?.attempts ?? GENERATION_NOT_FOUND_RETRY_ATTEMPTS));
+	const baseDelayMs = Math.max(0, options.notFoundRetry?.baseDelayMs ?? GENERATION_NOT_FOUND_RETRY_BASE_DELAY_MS);
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			const response = await fetchImpl(`${OPENROUTER_API_BASE}/generation?id=${encodeURIComponent(generationId)}`, {
+				headers: { Accept: "application/json", Authorization: `Bearer ${options.apiKey}` },
+				signal: options.signal,
+			});
+			if (response.status === 404 && attempt < maxAttempts) {
+				if (!(await waitForRetryDelay(attempt * baseDelayMs, options.signal))) return undefined;
+				continue;
+			}
+			if (!response.ok) return undefined;
+			const json = (await response.json()) as Record<string, unknown>;
+			const data = typeof json.data === "object" && json.data !== null ? (json.data as Record<string, unknown>) : {};
+			if (typeof data.provider_name === "string" && data.provider_name.length > 0) return data.provider_name;
+			const providerResponses = Array.isArray(data.provider_responses) ? data.provider_responses : [];
+			for (const entry of providerResponses) {
+				if (typeof entry !== "object" || entry === null) continue;
+				const name = (entry as Record<string, unknown>).provider_name;
+				if (typeof name === "string" && name.length > 0) return name;
+			}
+			return undefined;
+		} catch (error) {
+			logger.debug("OpenRouter generation backfill failed", { generationId, error: String(error) });
+			return undefined;
 		}
-		return undefined;
-	} catch (error) {
-		logger.debug("OpenRouter generation backfill failed", { generationId, error: String(error) });
-		return undefined;
 	}
+	return undefined;
 }

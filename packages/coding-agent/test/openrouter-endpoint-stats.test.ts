@@ -185,7 +185,7 @@ describe("fetchOpenRouterGenerationProvider", () => {
 		expect(provider).toBe("Amazon Bedrock");
 	});
 
-	it("sends the API key without leaking it into errors, and no-ops on 404", async () => {
+	it("sends the API key without leaking it into errors, and gives up after bounded 404 retries", async () => {
 		let authorization = "";
 		const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
 			authorization = new Headers(init?.headers).get("authorization") ?? "";
@@ -194,9 +194,43 @@ describe("fetchOpenRouterGenerationProvider", () => {
 		const provider = await fetchOpenRouterGenerationProvider("gen-bogus", {
 			apiKey: "test-key",
 			fetchImpl: fetchMock as unknown as typeof fetch,
+			notFoundRetry: { attempts: 3, baseDelayMs: 1 },
 		});
 		expect(provider).toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledTimes(3);
 		expect(authorization).toBe("Bearer test-key");
+	});
+
+	// Contract: the generation record is eventually consistent — it 404s while
+	// the turn streams and for ~1–2s after stream end (verified live 2026-08).
+	// The backfill fires at message_end, so it must retry past that window or
+	// OpenRouter turns (Responses wire carries no `provider` field) never get
+	// attributed and routing-stats.json is never written.
+	it("retries the 404 until the eventually-consistent record appears", async () => {
+		let calls = 0;
+		const fetchMock = vi.fn(async () => {
+			calls++;
+			if (calls < 3) return jsonResponse({ error: { message: "not found", code: 404 } }, 404);
+			return jsonResponse({ data: { id: "gen-lagged", provider_name: "Modal" } });
+		});
+		const provider = await fetchOpenRouterGenerationProvider("gen-lagged", {
+			apiKey: "test-key",
+			fetchImpl: fetchMock as unknown as typeof fetch,
+			notFoundRetry: { attempts: 5, baseDelayMs: 1 },
+		});
+		expect(provider).toBe("Modal");
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+	});
+
+	it("does not retry non-404 failures", async () => {
+		const fetchMock = vi.fn(async () => jsonResponse({ error: { message: "boom" } }, 500));
+		const provider = await fetchOpenRouterGenerationProvider("gen-1", {
+			apiKey: "test-key",
+			fetchImpl: fetchMock as unknown as typeof fetch,
+			notFoundRetry: { attempts: 5, baseDelayMs: 1 },
+		});
+		expect(provider).toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
 	it("swallows network errors (backfill is best-effort)", async () => {
