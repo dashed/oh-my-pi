@@ -4,8 +4,18 @@
 
 ### Added
 
+- Add a lead-independent team observer (`observer.*` settings): a deterministic, zero-LLM process monitor that detects stuck agents, retry loops, parked agents with claimable work, team-board deadlocks, cost/token runaway, all-idle teams, and orphaned agents, and escalates via status line, hub nudges, and desktop notifications — never takes kill authority.
 - Add an opt-out swarm ensemble for tiny-tier background calls (`swarm.*` settings): three identical full-strength parallel calls (reasoning enabled, no per-member handicaps, uncapped output, full context window) with a 2-of-3 quorum, majority-vote for classifiers and a merge pass for generation, plus a single-call fallback on quorum failure. Fixes tiny-role calls returning empty on reasoning models: classifier/title budgets raised (1024→2048) and prompts are no longer truncated below the model window.
 - Add a persistent agent panel below the prompt editor listing live subagents (shared row renderer with the Agent Hub): `alt+down`/`ctrl+down` to enter, arrows to select, `Enter` to open a teammate's transcript and message it directly, `Esc` to interrupt the selected agent's current turn without killing it.
+
+### Changed
+
+- Coalesce consecutive identical warnings into a single row with a `(×N)` count, ending warning spam when a turn dies repeatedly (e.g. failed todo updates during stream stalls).
+- Harden terminal-bound and on-disk strings: tool-activity labels, upstream provider names, and team-board content are sanitized against control-byte (ANSI/OSC) injection; the team board enforces 0700/0600 permissions and token-verified lock ownership; `/provider ignore` validates slug charsets; OpenRouter generation backfill maps display names to endpoint slugs.
+
+### Fixed
+
+- The advisor no longer discards valid advice when a model (e.g. a reasoning model leaking chat-template envelopes) emits tool calls outside its granted read-only set: unauthorized calls fail in-band, the turn retries once with a tightened tooling constraint, and repeated quarantines latch the advisor off for the session with a single notice.
 - Add a shared team task board via a new `team` tool: tasks live file-backed under `~/.omp/teams/<session>/` with lock-protected claim/complete/release and `blockedBy` dependency gating, so subagents self-coordinate pull-style; claims and completions broadcast over hub.
 - Add OpenRouter routing control: per-provider rolling stats (median tok/s, TTFT p50) persisted to `~/.omp/agent/routing-stats.json` and surfaced by `/provider`, enriched with OpenRouter-reported latency/throughput; slow providers trigger a one-line notice with a ready ban command; `providers.openrouter.{ignore,only,order,sort}` settings apply per request without restart, and `/provider ignore|unignore <slug>` persists bans to `config.yml`.
 - Surface keyboard shortcuts in the UI: contextual footer hints across the agent hub, selectors, dialogs, and editors now render labels from the live keybinding registry, so custom rebinds are reflected; open the full shortcuts panel with `f1` or `ctrl+/` (also `/hotkeys`); welcome splash now hints at it.
