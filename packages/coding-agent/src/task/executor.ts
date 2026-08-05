@@ -1004,6 +1004,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		tokens: 0,
 		cost: 0,
 		durationMs: 0,
+		startedAtMs: startTime,
 		modelOverride: args.modelOverride,
 	};
 

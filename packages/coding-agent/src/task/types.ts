@@ -425,6 +425,12 @@ export interface AgentProgress {
 	/** Cumulative billing cost in USD, accumulated incrementally from message_end events. */
 	cost: number;
 	durationMs: number;
+	/**
+	 * Wall-clock start of the current run (`Date.now()` at spawn). `durationMs`
+	 * only advances on progress emissions, so live UIs use this with their own
+	 * render tick to show a continuously ticking elapsed-since-start.
+	 */
+	startedAtMs?: number;
 	modelOverride?: string | string[];
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
 	resolvedModel?: string;

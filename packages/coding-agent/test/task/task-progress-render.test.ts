@@ -96,6 +96,60 @@ describe("task progress rendering", () => {
 		expect(rawRow0).toBe(rawRow1);
 	});
 
+	it("shows a ticking elapsed-since-start on running rows", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		const progress = runningProgress({
+			id: "CountPackages",
+			description: "List workspace packages",
+			startedAtMs: 1_000_000,
+		});
+
+		const renderRow = (timeMs: number): string => {
+			vi.spyOn(Date, "now").mockReturnValue(timeMs);
+			return Bun.stripANSI(
+				findRow(
+					taskToolRenderer.renderResult(
+						{ content: [{ type: "text", text: "" }], details: detailsFor(progress) },
+						options,
+						theme,
+					),
+					"CountPackages",
+				),
+			);
+		};
+
+		expect(renderRow(1_000_000 + 192_000)).toContain("3m12s");
+		// The elapsed derives from the render clock, so it advances between
+		// progress emissions without a new executor snapshot.
+		expect(renderRow(1_000_000 + 247_000)).toContain("4m7s");
+	});
+
+	it("keeps completed rows free of the live elapsed timer", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		vi.spyOn(Date, "now").mockReturnValue(1_000_000 + 192_000);
+		const progress = runningProgress({
+			id: "CountPackages",
+			description: "List workspace packages",
+			status: "completed",
+			startedAtMs: 1_000_000,
+		});
+
+		const row = Bun.stripANSI(
+			findRow(
+				taskToolRenderer.renderResult(
+					{ content: [{ type: "text", text: "" }], details: detailsFor(progress) },
+					options,
+					theme,
+				),
+				"CountPackages",
+			),
+		);
+		expect(row).not.toContain("3m12s");
+		expect(row).not.toContain(theme.icon.time);
+	});
+
 	// Regression: the ⟨agent⟩ type badge must survive past the streaming call
 	// preview — it stays on live progress rows and on finished result rows, and
 	// the generic `task` worker stays bare.

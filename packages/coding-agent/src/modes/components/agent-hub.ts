@@ -15,7 +15,7 @@
  */
 import { type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { Container, Ellipsis, matchesKey, type OverlayHandle, padding, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatAge, getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { formatAge, formatDuration, getProjectDir, logger } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { IrcBus } from "../../irc/bus";
@@ -490,7 +490,8 @@ export class AgentHubOverlayComponent extends Container {
 	 * One agent entry, 1-2 lines:
 	 * `❯ ⟳ Name  type  ↳ parent  ⧉ 2 ········ model ◒ level · age` — identity
 	 * left, metadata right-aligned (inlined when the terminal is too narrow) —
-	 * plus an indented dim task line when the agent's work is known.
+	 * plus an indented dim task line when the agent's work is known. Running
+	 * agents show a ticking elapsed-since-start (`⏱ 3m12s`) instead of age.
 	 */
 	#renderEntry(ref: AgentRef, selected: boolean, width: number): string[] {
 		const max = Math.max(1, width - 2);
@@ -515,7 +516,16 @@ export class AgentHubOverlayComponent extends Container {
 		const meta: string[] = [];
 		const badge = modelBadge(ref, observed);
 		if (badge) meta.push(badge);
-		meta.push(theme.fg("dim", formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))));
+		if (ref.status === "running") {
+			// Live elapsed-since-start, ticking via #ageTimer. Age-since-activity
+			// is pinned at "just now" by running heartbeats, so it carries no
+			// information here. Prefer the executor-reported run start (fresh
+			// after a revive or follow-up turn) over the ref's registration time.
+			const startMs = observed?.progress?.startedAtMs ?? ref.createdAt;
+			meta.push(theme.fg("dim", `${theme.icon.time} ${formatDuration(Math.max(0, Date.now() - startMs))}`));
+		} else {
+			meta.push(theme.fg("dim", formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))));
+		}
 		const right = meta.join(theme.sep.dot);
 
 		const leftWidth = visibleWidth(left);

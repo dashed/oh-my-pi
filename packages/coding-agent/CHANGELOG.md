@@ -12,6 +12,10 @@
 
 - Added automatic detection of common Ungoogled Chromium Linux installations for the browser tool.
 
+### Added
+
+- Show a live elapsed-time timer for running subagents in the Agent Hub rows and inline task transcript rows.
+
 ### Changed
 
 - Restored the legacy project-scoped session directory naming scheme and removed its automatic migration ([#7646](https://github.com/can1357/oh-my-pi/issues/7646)).

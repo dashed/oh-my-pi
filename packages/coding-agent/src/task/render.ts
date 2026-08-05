@@ -954,6 +954,13 @@ function renderAgentProgress(
 			const taskPreview = previewLine(sanitizeText(progress.assignment ?? progress.task), 40);
 			statusLine += ` ${theme.fg("muted", taskPreview)}`;
 		}
+		// Live elapsed-since-start, derived from the render tick's nowMs so it
+		// keeps ticking between progress emissions (durationMs only advances
+		// when the executor publishes a snapshot).
+		if (progress.startedAtMs) {
+			const elapsed = Math.max(0, nowMs - progress.startedAtMs);
+			statusLine += `${theme.sep.dot}${theme.fg("dim", `${theme.icon.time} ${formatDuration(elapsed)}`)}`;
+		}
 		statusLine = appendAgentStats(statusLine, { ...progress, showResolvedModelBadge: showBadge }, theme);
 	} else if (progress.status === "completed") {
 		statusLine = appendAgentStats(statusLine, { ...progress, showResolvedModelBadge: showBadge }, theme);
