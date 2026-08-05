@@ -2650,6 +2650,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	if (toolNames && !options.restrictToolNames && !toolNames.includes("hub")) {
 		toolNames = [...toolNames, "hub"];
 	}
+	// Every spawned subagent shares the session team's task board so it can
+	// claim and report work, regardless of whether it may itself spawn.
+	if (toolNames && !options.restrictToolNames && !toolNames.includes("team")) {
+		toolNames = [...toolNames, "team"];
+	}
 	if (toolNames?.includes("exec")) {
 		const backends = resolveEvalBackends({ settings } as ToolSession);
 		const expanded = toolNames.filter(name => name !== "exec");

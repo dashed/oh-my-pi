@@ -19,15 +19,22 @@ const expectedDocPaths = (name: string): string[] => [
 // these custom tools are not present there, so the coverage list is explicit.
 const CUSTOM_TOOL_NAMES = ["generate_image", "tts"] as const;
 
+// Built-ins deliberately documented by their tool description string instead
+// of a docs/tools page (agent-facing, self-contained ops reference).
+const DOC_EXEMPT_TOOL_NAMES: Record<string, true> = { team: true };
+
 describe("omp:// root docs coverage", () => {
-	it.each([...BUILTIN_TOOL_NAMES])("documents builtin tool %s", name => {
-		const candidates = expectedDocPaths(name);
-		const present = candidates.find(candidate => fs.existsSync(candidate));
-		expect(
-			present,
-			`Missing docs/tools/<name>.md for built-in tool "${name}". Tried: ${candidates.join(", ")}.`,
-		).toBeDefined();
-	});
+	it.each([...BUILTIN_TOOL_NAMES].filter(name => !(name in DOC_EXEMPT_TOOL_NAMES)))(
+		"documents builtin tool %s",
+		name => {
+			const candidates = expectedDocPaths(name);
+			const present = candidates.find(candidate => fs.existsSync(candidate));
+			expect(
+				present,
+				`Missing docs/tools/<name>.md for built-in tool "${name}". Tried: ${candidates.join(", ")}.`,
+			).toBeDefined();
+		},
+	);
 
 	it.each([...CUSTOM_TOOL_NAMES])("documents injected custom tool %s", name => {
 		const candidates = expectedDocPaths(name);
