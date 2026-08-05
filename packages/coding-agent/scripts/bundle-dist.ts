@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { buildDocsIndexPayload } from "./generate-docs-index";
+import { stampForkCommit } from "./stamp-fork-commit";
 
 const packageDir = path.join(import.meta.dir, "..");
 const outDir = path.join(packageDir, "dist");
@@ -90,6 +91,17 @@ async function cleanBundleOutputs(): Promise<void> {
 
 async function main(): Promise<void> {
 	const start = Bun.nanoseconds();
+	// Bake the fork commit hash into src/fork-version.ts before bundling so both
+	// dist/cli.js and the stamped source ship in the tarball. Left stamped on
+	// purpose — `bun pm pack` collects files after prepack completes — so the
+	// stamp survives into the package; `stamp:fork-commit:reset` restores the
+	// committed placeholder.
+	const forkCommit = await stampForkCommit();
+	process.stdout.write(
+		forkCommit
+			? `Stamped fork commit ${forkCommit} into src/fork-version.ts\n`
+			: "No jj/git commit found; bundling plain version display\n",
+	);
 	await cleanBundleOutputs();
 	// The npm bundle ships no stats dashboard sources, so embed the dashboard
 	// archive the same way compiled binaries do (scripts/build-binary.ts). Reset

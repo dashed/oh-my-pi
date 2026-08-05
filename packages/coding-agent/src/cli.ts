@@ -22,7 +22,6 @@ import {
 	MIN_BUN_VERSION,
 	resolveProfileEnv,
 	setProfile,
-	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
 import { interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
 import { setProcessName } from "@oh-my-pi/pi-utils/process-name";
@@ -33,6 +32,7 @@ import { startJsEvalProcess } from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
 import { TERMINAL_OUTPUT_WORKER_ARG } from "./launch/terminal-output-worker-protocol";
+import { DISPLAY_VERSION } from "./version-display";
 import { LSP_MUX_WORKER_ARG } from "./lsp/mux/protocol";
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
 import { smokeTestComputerWorker } from "./tools/computer/supervisor";
@@ -409,7 +409,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	return run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
+	return run({ bin: APP_NAME, version: DISPLAY_VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 }
 
 // Floating call instead of top-level await: TLA forces `--bytecode` (CJS

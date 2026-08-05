@@ -94,6 +94,7 @@ import type { LspStartupServerInfo } from "./tools";
 import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
 import { withTimeoutSignal } from "./utils/fetch-timeout";
+import { DISPLAY_VERSION } from "./version-display";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
@@ -1156,7 +1157,7 @@ export async function runRootCommand(
 	const notifs: (InteractiveModeNotify | null)[] = [];
 
 	if (parsedArgs.version) {
-		writeStartupNotice(parsedArgs, `${VERSION}\n`);
+		writeStartupNotice(parsedArgs, `${DISPLAY_VERSION}\n`);
 		process.exit(0);
 	}
 
@@ -1692,7 +1693,7 @@ export async function runRootCommand(
 			logger.endTiming();
 			await runInteractiveMode(
 				session,
-				VERSION,
+				DISPLAY_VERSION,
 				startupChangelog,
 				notifs,
 				versionCheckPromise,
