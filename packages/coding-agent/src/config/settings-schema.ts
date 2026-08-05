@@ -5469,6 +5469,12 @@ export const SETTINGS_SCHEMA = {
 	// (last 20 turns) and the post-turn dim notice. Config-file only.
 	"providers.openrouter.slowTokensPerSecond": { type: "number", default: 15 },
 	"providers.openrouter.slowTtftMs": { type: "number", default: 5000 },
+	// Flaky-upstream detection thresholds for the rolling per-provider error
+	// channel (last 20 turns) and the post-turn dim notice: flag when the
+	// window carries ≥ flakyMinErrors errored turns AND errors make up at
+	// least flakyErrorRate of the window's turns. Config-file only.
+	"providers.openrouter.flakyMinErrors": { type: "number", default: 3 },
+	"providers.openrouter.flakyErrorRate": { type: "number", default: 0.3 },
 	"providers.fetch": {
 		type: "enum",
 		values: ["auto", "native", "trafilatura", "lynx", "parallel", "jina"] as const,

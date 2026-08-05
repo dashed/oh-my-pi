@@ -10,8 +10,13 @@
  * transport telemetry, while detection here needs the last-N-turns view
  * synchronously at turn end.
  *
- * Slow detection (v1) is notice-only: {@link SlowProviderNotifier} surfaces a
- * single dim status line per slug per session pointing at `/provider ignore`.
+ * Slow + flaky detection is notice-only: {@link ProviderHealthNotifier}
+ * surfaces a single dim status line per slug per session pointing at
+ * `/provider ignore`. Flaky detection reads a parallel rolling error channel:
+ * errored turns (classified by {@link classifyRoutingError}) recorded per
+ * slug, with unattributable errors landing in the explicit
+ * {@link UNKNOWN_PROVIDER_SLUG} bucket so they never poison a real slug's
+ * stats.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -36,11 +41,18 @@ export interface RoutingTurnSample {
 /** Rolling-window summary for one upstream slug. */
 export interface RoutingProviderSummary {
 	slug: string;
+	/** Success turns in the window (turns that produced a perf sample). */
 	turns: number;
 	/** Median per-turn output tokens/second across the window. */
 	medianTokensPerSecond: number | undefined;
 	/** Median time-to-first-token across turns that reported one. */
 	ttftP50Ms: number | undefined;
+	/** Errored turns in the window. */
+	errors: number;
+	/** errors / (turns + errors) over the window; 0 when no errors recorded. */
+	errorRate: number;
+	/** Per-class error counts across the window (only classes that occurred). */
+	errorCounts: Partial<Record<RoutingErrorClass, number>>;
 }
 
 export interface SlowProviderThresholds {
@@ -48,6 +60,78 @@ export interface SlowProviderThresholds {
 	minTokensPerSecond: number;
 	/** Flag when the TTFT p50 rises above this (ms). */
 	maxTtftMs: number;
+}
+
+export interface FlakyProviderThresholds {
+	/** Flag when the window carries at least this many errored turns. */
+	minErrors: number;
+	/** Flag when the window error rate (errors / total turns) reaches this. */
+	minErrorRate: number;
+}
+
+/** Bucket for errored turns with no attributable upstream. */
+export const UNKNOWN_PROVIDER_SLUG = "unknown";
+
+/** Provider-stream error classes the rolling error channel distinguishes. */
+export const ROUTING_ERROR_CLASSES = [
+	"stream-stall",
+	"truncated-stream",
+	"first-event-timeout",
+	"network",
+	"other",
+] as const;
+export type RoutingErrorClass = (typeof ROUTING_ERROR_CLASSES)[number];
+
+/** One errored turn's attribution sample. */
+export interface RoutingErrorSample {
+	class: RoutingErrorClass;
+}
+
+/** Singular class labels for the flaky notice; pluralized by appending "s". Also the class-membership table. */
+const ERROR_CLASS_LABELS: Record<RoutingErrorClass, string> = {
+	"stream-stall": "stream stall",
+	"truncated-stream": "truncated stream",
+	"first-event-timeout": "first-event timeout",
+	network: "network error",
+	other: "error",
+};
+
+const NETWORK_ERROR_RE =
+	/network connection lost|fetch failed|socket hang up|econnreset|econnrefused|etimedout|connection reset|other side closed|network error/;
+
+/**
+ * Classify an errored turn's `errorMessage` into a routing error class, keyed
+ * on the exact wordings the pi-ai stream layer emits:
+ * - idle-watchdog aborts ("… stream stalled while waiting for the next
+ *   event", incl. the generic "Provider stream stalled …" lazy wrapper and
+ *   "stream stall" retry wordings) → `stream-stall`;
+ * - cold-start watchdog ("… stream timed out while waiting for the first
+ *   event") → `first-event-timeout`;
+ * - mid-stream transport closes ("… closed before a terminal response event
+ *   was received", "… ended without a finish reason (connection dropped or
+ *   response truncated)", "stream closed without terminal event") →
+ *   `truncated-stream`;
+ * - TCP/TLS-level failures (incl. OpenRouter's "server_error: Network
+ *   connection lost") → `network`;
+ * - everything else (incl. missing messages) → `other`.
+ */
+export function classifyRoutingError(errorMessage: string | undefined): RoutingErrorClass {
+	if (!errorMessage) return "other";
+	const message = errorMessage.toLowerCase();
+	if (message.includes("stalled while waiting for the next event") || message.includes("stream stall")) {
+		return "stream-stall";
+	}
+	if (message.includes("timed out while waiting for the first event")) return "first-event-timeout";
+	if (
+		message.includes("closed before a terminal") ||
+		message.includes("without a finish reason") ||
+		message.includes("without terminal event") ||
+		message.includes("truncat")
+	) {
+		return "truncated-stream";
+	}
+	if (NETWORK_ERROR_RE.test(message)) return "network";
+	return "other";
 }
 
 /** Raw turn measurements offered by the message_end handler. */
@@ -71,6 +155,20 @@ function finiteOrUndefined(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** Most frequent error class in the counts map, in stable class-declaration order. */
+function dominantErrorClass(counts: Partial<Record<RoutingErrorClass, number>>): RoutingErrorClass | undefined {
+	let best: RoutingErrorClass | undefined;
+	let bestCount = 0;
+	for (const errorClass of ROUTING_ERROR_CLASSES) {
+		const count = counts[errorClass] ?? 0;
+		if (count > bestCount) {
+			best = errorClass;
+			bestCount = count;
+		}
+	}
+	return best;
+}
+
 /**
  * Build the storable sample for a turn. Returns `undefined` when the turn
  * carries no usable signal (no measurable duration and no TTFT), so callers
@@ -88,7 +186,7 @@ export function buildRoutingTurnSample(input: RoutingTurnInput): RoutingTurnSamp
 
 interface PersistedRoutingStats {
 	version: number;
-	providers: Record<string, { samples: RoutingTurnSample[] }>;
+	providers: Record<string, { samples: RoutingTurnSample[]; errors?: RoutingErrorSample[] }>;
 }
 
 function parsePersistedSamples(raw: unknown): RoutingTurnSample[] {
@@ -103,6 +201,18 @@ function parsePersistedSamples(raw: unknown): RoutingTurnSample[] {
 		samples.push({ tokensPerSecond, ttftMs });
 	}
 	return samples;
+}
+
+function parsePersistedErrors(raw: unknown): RoutingErrorSample[] {
+	if (!Array.isArray(raw)) return [];
+	const errors: RoutingErrorSample[] = [];
+	for (const entry of raw) {
+		// Accept the `{ class }` sample shape and bare class strings.
+		const errorClass = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>).class : entry;
+		if (typeof errorClass !== "string" || !(errorClass in ERROR_CLASS_LABELS)) continue;
+		errors.push({ class: errorClass as RoutingErrorClass });
+	}
+	return errors;
 }
 
 async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
@@ -151,6 +261,7 @@ export class RoutingStatsTracker {
 	readonly #window: number;
 	readonly #saveThrottleMs: number;
 	readonly #samples = new Map<string, RoutingTurnSample[]>();
+	readonly #errors = new Map<string, RoutingErrorSample[]>();
 	#hydrated: Promise<void>;
 	#saveTimer: ReturnType<typeof setTimeout> | undefined;
 	#saveChain: Promise<void> = Promise.resolve();
@@ -178,18 +289,29 @@ export class RoutingStatsTracker {
 		this.#scheduleSave();
 	}
 
+	/** Record one errored turn for `slug` and schedule a throttled persist. */
+	recordError(slug: string, errorClass: RoutingErrorClass): void {
+		if (!slug) return;
+		const errors = this.#errors.get(slug) ?? [];
+		errors.push({ class: errorClass });
+		if (errors.length > this.#window) errors.splice(0, errors.length - this.#window);
+		this.#errors.set(slug, errors);
+		this.#scheduleSave();
+	}
+
 	/** Rolling summary for one slug; `undefined` when no turns are recorded. */
 	getSummary(slug: string): RoutingProviderSummary | undefined {
-		const samples = this.#samples.get(slug);
-		if (!samples || samples.length === 0) return undefined;
-		return this.#summarize(slug, samples);
+		const samples = this.#samples.get(slug) ?? [];
+		const errors = this.#errors.get(slug) ?? [];
+		if (samples.length === 0 && errors.length === 0) return undefined;
+		return this.#summarize(slug, samples, errors);
 	}
 
 	/** Rolling summaries for every tracked slug, sorted by slug. */
 	summaries(): RoutingProviderSummary[] {
-		return [...this.#samples.entries()]
-			.filter(([, samples]) => samples.length > 0)
-			.map(([slug, samples]) => this.#summarize(slug, samples))
+		return [...new Set([...this.#samples.keys(), ...this.#errors.keys()])]
+			.map(slug => this.#summarize(slug, this.#samples.get(slug) ?? [], this.#errors.get(slug) ?? []))
+			.filter(summary => summary.turns > 0 || summary.errors > 0)
 			.sort((a, b) => a.slug.localeCompare(b.slug));
 	}
 
@@ -217,6 +339,26 @@ export class RoutingStatsTracker {
 		return undefined;
 	}
 
+	/**
+	 * Flaky verdict for one slug: at least `minErrors` errored turns in the
+	 * window AND an error rate (errors / total turns) at `minErrorRate`.
+	 */
+	isFlaky(slug: string, thresholds: FlakyProviderThresholds): boolean {
+		return this.flakyReason(slug, thresholds) !== undefined;
+	}
+
+	/** Human-readable flaky reason ("3 stream stalls in 10 turns"), if flaky. */
+	flakyReason(slug: string, thresholds: FlakyProviderThresholds): string | undefined {
+		const summary = this.getSummary(slug);
+		if (!summary || summary.errors < thresholds.minErrors) return undefined;
+		if (summary.errorRate < thresholds.minErrorRate) return undefined;
+		const dominant = dominantErrorClass(summary.errorCounts);
+		if (!dominant) return undefined;
+		const count = summary.errorCounts[dominant] ?? summary.errors;
+		const label = ERROR_CLASS_LABELS[dominant];
+		return `${count} ${count === 1 ? label : `${label}s`} in ${summary.turns + summary.errors} turns`;
+	}
+
 	/** Flush any pending throttled write now. */
 	async flush(): Promise<void> {
 		if (this.#saveTimer) {
@@ -236,12 +378,23 @@ export class RoutingStatsTracker {
 		}
 	}
 
-	#summarize(slug: string, samples: readonly RoutingTurnSample[]): RoutingProviderSummary {
+	#summarize(
+		slug: string,
+		samples: readonly RoutingTurnSample[],
+		errors: readonly RoutingErrorSample[],
+	): RoutingProviderSummary {
+		const errorCounts: Partial<Record<RoutingErrorClass, number>> = {};
+		for (const sample of errors) {
+			errorCounts[sample.class] = (errorCounts[sample.class] ?? 0) + 1;
+		}
 		return {
 			slug,
 			turns: samples.length,
 			medianTokensPerSecond: median(samples.map(s => s.tokensPerSecond).filter((v): v is number => v !== undefined)),
 			ttftP50Ms: median(samples.map(s => s.ttftMs).filter((v): v is number => v !== undefined)),
+			errors: errors.length,
+			errorRate: errors.length === 0 ? 0 : errors.length / (samples.length + errors.length),
+			errorCounts,
 		};
 	}
 
@@ -255,9 +408,15 @@ export class RoutingStatsTracker {
 			if (typeof parsed !== "object" || parsed === null) throw new Error("routing stats root is not an object");
 			const providers = typeof parsed.providers === "object" && parsed.providers !== null ? parsed.providers : {};
 			for (const [slug, entry] of Object.entries(providers)) {
-				if (this.#samples.has(slug)) continue; // in-memory turns are newer
-				const samples = parsePersistedSamples(entry?.samples).slice(-this.#window);
-				if (samples.length > 0) this.#samples.set(slug, samples);
+				if (!this.#samples.has(slug)) {
+					// in-memory turns are newer
+					const samples = parsePersistedSamples(entry?.samples).slice(-this.#window);
+					if (samples.length > 0) this.#samples.set(slug, samples);
+				}
+				if (!this.#errors.has(slug)) {
+					const errors = parsePersistedErrors(entry?.errors).slice(-this.#window);
+					if (errors.length > 0) this.#errors.set(slug, errors);
+				}
 			}
 		} catch (error) {
 			// Corrupt or unreadable file: start clean rather than losing the turn.
@@ -283,7 +442,10 @@ export class RoutingStatsTracker {
 		const body: PersistedRoutingStats = {
 			version: ROUTING_STATS_FILE_VERSION,
 			providers: Object.fromEntries(
-				[...this.#samples.entries()].map(([slug, samples]) => [slug, { samples: [...samples] }]),
+				[...new Set([...this.#samples.keys(), ...this.#errors.keys()])].map(slug => [
+					slug,
+					{ samples: [...(this.#samples.get(slug) ?? [])], errors: [...(this.#errors.get(slug) ?? [])] },
+				]),
 			),
 		};
 		this.#saveChain = this.#saveChain.then(async () => {
@@ -337,12 +499,56 @@ export function routingSampleFromMessage(
  */
 export function isOpenRouterBackfillCandidate(message: RoutingMessageSlice): boolean {
 	if (message.stopReason === "aborted" || message.stopReason === "error") return false;
+	return hasOpenRouterGenerationId(message);
+}
+
+/** Structural slice of an errored assistant message the error recorder reads. */
+export interface RoutingErrorMessageSlice {
+	upstreamProvider?: string;
+	responseId?: string;
+	provider?: string;
+	stopReason: string;
+	errorMessage?: string;
+}
+
+function hasOpenRouterGenerationId(message: {
+	upstreamProvider?: string;
+	responseId?: string;
+	provider?: string;
+}): boolean {
 	if (message.upstreamProvider) return false;
 	return (
 		message.provider === "openrouter" &&
 		typeof message.responseId === "string" &&
 		message.responseId.startsWith("gen-")
 	);
+}
+
+/**
+ * Extract the recordable error sample from a failed assistant message.
+ * Returns `undefined` for non-error turns. Turns without upstream attribution
+ * fall back to the explicit {@link UNKNOWN_PROVIDER_SLUG} bucket so they
+ * never poison a real slug's stats; callers with a `gen-…` id should prefer
+ * the generation-endpoint backfill ({@link isOpenRouterErrorBackfillCandidate})
+ * and only record the unknown bucket when attribution resolves to nothing.
+ */
+export function routingErrorFromMessage(
+	message: RoutingErrorMessageSlice,
+): { slug: string; sample: RoutingErrorSample } | undefined {
+	if (message.stopReason !== "error") return undefined;
+	return {
+		slug: message.upstreamProvider ?? UNKNOWN_PROVIDER_SLUG,
+		sample: { class: classifyRoutingError(message.errorMessage) },
+	};
+}
+
+/**
+ * Whether an errored OpenRouter turn is worth a generation-endpoint backfill:
+ * the stream died before naming an upstream but left a `gen-…` id.
+ */
+export function isOpenRouterErrorBackfillCandidate(message: RoutingErrorMessageSlice): boolean {
+	if (message.stopReason !== "error") return false;
+	return hasOpenRouterGenerationId(message);
 }
 
 let defaultTracker: RoutingStatsTracker | undefined;
@@ -363,28 +569,52 @@ export function resetRoutingStatsTrackerForTests(): void {
 }
 
 /**
- * Session-scoped dedup for the slow-upstream notice: fires at most once per
- * slug, pointing the operator at `/provider ignore`.
+ * Session-scoped dedup for the slow/flaky-upstream notices: each fires at
+ * most once per slug, pointing the operator at `/provider ignore`.
  */
-export class SlowProviderNotifier {
-	readonly #notified = new Set<string>();
+export class ProviderHealthNotifier {
+	readonly #notifiedSlow = new Set<string>();
+	readonly #notifiedFlaky = new Set<string>();
 
 	/**
 	 * Return the slow notice when `slug` newly qualifies; `undefined` when the
 	 * slug is fast, has too few turns, or was already flagged this session.
 	 */
-	maybeNotify(tracker: RoutingStatsTracker, slug: string, thresholds: SlowProviderThresholds): string | undefined {
-		if (this.#notified.has(slug)) return undefined;
+	maybeNotifySlow(tracker: RoutingStatsTracker, slug: string, thresholds: SlowProviderThresholds): string | undefined {
+		if (this.#notifiedSlow.has(slug)) return undefined;
 		const reason = tracker.slowReason(slug, thresholds);
 		if (!reason) return undefined;
-		this.#notified.add(slug);
-		const message = `${slug} slow (${reason}) — /provider ignore ${slug} to ban`;
-		return message;
+		this.#notifiedSlow.add(slug);
+		return `${slug} slow (${reason}) — /provider ignore ${slug} to ban`;
+	}
+
+	/**
+	 * Return the flaky notice when `slug` newly qualifies; `undefined` when
+	 * the slug is below the error thresholds or was already flagged this
+	 * session. The {@link UNKNOWN_PROVIDER_SLUG} bucket never notifies — it
+	 * names no ban-able upstream.
+	 */
+	maybeNotifyFlaky(
+		tracker: RoutingStatsTracker,
+		slug: string,
+		thresholds: FlakyProviderThresholds,
+	): string | undefined {
+		if (slug === UNKNOWN_PROVIDER_SLUG) return undefined;
+		if (this.#notifiedFlaky.has(slug)) return undefined;
+		const reason = tracker.flakyReason(slug, thresholds);
+		if (!reason) return undefined;
+		this.#notifiedFlaky.add(slug);
+		return `${slug} erroring (${reason}) — /provider ignore ${slug} to ban`;
 	}
 
 	/** Forget a flagged slug (e.g. after /provider unignore) within this session. */
 	reset(slug?: string): void {
-		if (slug === undefined) this.#notified.clear();
-		else this.#notified.delete(slug);
+		if (slug === undefined) {
+			this.#notifiedSlow.clear();
+			this.#notifiedFlaky.clear();
+		} else {
+			this.#notifiedSlow.delete(slug);
+			this.#notifiedFlaky.delete(slug);
+		}
 	}
 }

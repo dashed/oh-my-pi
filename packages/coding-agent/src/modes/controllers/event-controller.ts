@@ -30,12 +30,17 @@ import {
 } from "../../session/openrouter-endpoint-stats";
 import {
 	buildRoutingTurnSample,
+	type FlakyProviderThresholds,
 	getRoutingStatsTracker,
 	isOpenRouterBackfillCandidate,
+	isOpenRouterErrorBackfillCandidate,
+	ProviderHealthNotifier,
+	type RoutingErrorClass,
 	type RoutingStatsTracker,
+	routingErrorFromMessage,
 	routingSampleFromMessage,
-	SlowProviderNotifier,
 	type SlowProviderThresholds,
+	UNKNOWN_PROVIDER_SLUG,
 } from "../../session/routing-stats";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { formatToolActivity, previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
@@ -144,8 +149,8 @@ export class EventController {
 	// #handleMessageEnd / #handleAgentStart).
 	#pinnedErrorComponent: AssistantMessageComponent | undefined = undefined;
 	#retrySupersededAssistantComponents = new Map<string, AssistantMessageComponent>();
-	// Slow-upstream notice dedup: one dim line per OpenRouter slug per session.
-	#slowProviderNotifier = new SlowProviderNotifier();
+	// Slow/flaky-upstream notice dedup: one dim line per OpenRouter slug per session.
+	#providerHealthNotifier = new ProviderHealthNotifier();
 	#retrySupersededAssistantQueue: AssistantMessageComponent[] = [];
 	// Set when `auto_retry_start` fires and cleared by `auto_retry_end` (both
 	// outcomes) — true for exactly the window a retry is outstanding. Gates
@@ -1288,6 +1293,14 @@ export class EventController {
 	 */
 	#recordUpstreamRoutingSample(message: AssistantMessage): void {
 		const tracker = getRoutingStatsTracker();
+		// Errored turns feed the rolling error channel instead: the stream
+		// failed, so there is no perf sample — but the failure itself is the
+		// flaky-detection signal. Silent aborts are local control flow, not
+		// provider failures.
+		if (message.stopReason === "error" && !isSilentAbort(message)) {
+			this.#recordUpstreamRoutingError(tracker, message);
+			return;
+		}
 		const recorded = routingSampleFromMessage(message);
 		if (recorded) {
 			tracker.record(recorded.slug, recorded.sample);
@@ -1299,6 +1312,27 @@ export class EventController {
 		}
 	}
 
+	/**
+	 * Record an errored turn against its serving upstream: `upstreamProvider`
+	 * when the stream named one, else a generation-endpoint backfill when a
+	 * `gen-…` id exists, else the explicit `unknown` bucket so unattributable
+	 * errors never poison a real slug's stats.
+	 */
+	#recordUpstreamRoutingError(tracker: RoutingStatsTracker, message: AssistantMessage): void {
+		const recorded = routingErrorFromMessage(message);
+		if (!recorded) return;
+		if (message.upstreamProvider) {
+			tracker.recordError(recorded.slug, recorded.sample.class);
+			this.#notifyIfFlaky(tracker, recorded.slug);
+			return;
+		}
+		if (isOpenRouterErrorBackfillCandidate(message)) {
+			void this.#backfillUpstreamErrorAttribution(message, recorded.sample.class);
+			return;
+		}
+		tracker.recordError(UNKNOWN_PROVIDER_SLUG, recorded.sample.class);
+	}
+
 	#slowProviderThresholds(): SlowProviderThresholds {
 		return {
 			minTokensPerSecond: settings.get("providers.openrouter.slowTokensPerSecond"),
@@ -1306,41 +1340,74 @@ export class EventController {
 		};
 	}
 
+	#flakyProviderThresholds(): FlakyProviderThresholds {
+		return {
+			minErrors: settings.get("providers.openrouter.flakyMinErrors"),
+			minErrorRate: settings.get("providers.openrouter.flakyErrorRate"),
+		};
+	}
+
 	#notifyIfSlow(tracker: RoutingStatsTracker, slug: string): void {
-		const notice = this.#slowProviderNotifier.maybeNotify(tracker, slug, this.#slowProviderThresholds());
+		const notice = this.#providerHealthNotifier.maybeNotifySlow(tracker, slug, this.#slowProviderThresholds());
 		if (notice) this.ctx.showStatus(notice, { dim: true });
 	}
 
-	async #backfillUpstreamAttribution(message: AssistantMessage): Promise<void> {
+	#notifyIfFlaky(tracker: RoutingStatsTracker, slug: string): void {
+		const notice = this.#providerHealthNotifier.maybeNotifyFlaky(tracker, slug, this.#flakyProviderThresholds());
+		if (notice) this.ctx.showStatus(notice, { dim: true });
+	}
+
+	/**
+	 * Resolve a turn's serving upstream slug via the account-scoped generation
+	 * endpoint. The generation endpoint reports a display name ("Amazon
+	 * Bedrock"); stats and bans key on endpoint tags ("amazon-bedrock"), so
+	 * map before recording. Returns `undefined` on any failure — backfill is
+	 * best-effort and must never break a turn.
+	 */
+	async #resolveBackfillSlug(message: AssistantMessage): Promise<string | undefined> {
 		const generationId = message.responseId;
-		if (!generationId) return;
+		if (!generationId) return undefined;
 		try {
 			const apiKey = await this.ctx.session.modelRegistry.authStorage.getApiKey(
 				"openrouter",
 				this.ctx.session.sessionId,
 			);
-			if (!apiKey) return;
+			if (!apiKey) return undefined;
 			const providerName = await fetchOpenRouterGenerationProvider(generationId, { apiKey });
-			if (!providerName) return;
-			// The generation endpoint reports a display name ("Amazon Bedrock");
-			// stats and bans key on endpoint tags ("amazon-bedrock"), so map before
-			// recording. Unmappable names are skipped (logged at debug inside).
+			if (!providerName) return undefined;
 			const modelId = this.ctx.session.model?.id;
-			if (!modelId) return;
-			const slug = await resolveOpenRouterGenerationTag(modelId, providerName);
-			if (!slug) return;
-			const sample = buildRoutingTurnSample({
-				outputTokens: message.usage.output,
-				durationMs: message.duration,
-				ttftMs: message.ttft,
-			});
-			if (!sample) return;
-			const tracker = getRoutingStatsTracker();
-			tracker.record(slug, sample);
-			this.#notifyIfSlow(tracker, slug);
+			if (!modelId) return undefined;
+			return await resolveOpenRouterGenerationTag(modelId, providerName);
 		} catch (error) {
 			logger.debug("OpenRouter upstream attribution backfill failed", { error: String(error) });
+			return undefined;
 		}
+	}
+
+	async #backfillUpstreamAttribution(message: AssistantMessage): Promise<void> {
+		const slug = await this.#resolveBackfillSlug(message);
+		if (!slug) return;
+		const sample = buildRoutingTurnSample({
+			outputTokens: message.usage.output,
+			durationMs: message.duration,
+			ttftMs: message.ttft,
+		});
+		if (!sample) return;
+		const tracker = getRoutingStatsTracker();
+		tracker.record(slug, sample);
+		this.#notifyIfSlow(tracker, slug);
+	}
+
+	/** Errored-turn backfill: unresolved attribution lands in the unknown bucket. */
+	async #backfillUpstreamErrorAttribution(message: AssistantMessage, errorClass: RoutingErrorClass): Promise<void> {
+		const slug = await this.#resolveBackfillSlug(message);
+		const tracker = getRoutingStatsTracker();
+		if (!slug) {
+			tracker.recordError(UNKNOWN_PROVIDER_SLUG, errorClass);
+			return;
+		}
+		tracker.recordError(slug, errorClass);
+		this.#notifyIfFlaky(tracker, slug);
 	}
 
 	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {

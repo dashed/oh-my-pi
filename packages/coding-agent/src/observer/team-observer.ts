@@ -29,7 +29,7 @@
  *   10s from registration).
  *
  * Action ladder ONLY — L1 dim status notice (dedup per pathology+agent per
- * window, SlowProviderNotifier pattern) → L2 IrcBus.send DM nudge (gated by
+ * window, ProviderHealthNotifier pattern) → L2 IrcBus.send DM nudge (gated by
  * observer.nudgeEnabled) → L3 TERMINAL.sendNotification to the user with the
  * exact manual fix. The observer NEVER parks, aborts, releases, or mutates
  * the board — kill/release authority stays with the user (hub `x`,
@@ -621,7 +621,7 @@ export class TeamObserver {
 			flag.lastNoticedAt = now;
 			flag.noticeCount++;
 
-			// L1: dim status notice (SlowProviderNotifier pattern). Agent/board-derived
+			// L1: dim status notice (ProviderHealthNotifier pattern). Agent/board-derived
 			// text is control-stripped before it reaches the terminal.
 			this.#showStatus(sanitizeText(`Observer: ${flag.summary} (${flag.subjectId}) — ${flag.fix}`));
 

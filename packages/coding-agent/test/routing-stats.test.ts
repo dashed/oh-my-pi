@@ -3,17 +3,25 @@
  * (session/routing-stats.ts) keeps the last 20 turns per slug, computes
  * median tok/s + TTFT p50 for slow detection (only at ≥3 turns), persists
  * throttled-atomically with corrupt-file tolerance, and the session-scoped
- * notifier fires the slow notice at most once per slug.
+ * notifier fires the slow notice at most once per slug. A parallel rolling
+ * error channel classifies errored turns (stream-stall / truncated-stream /
+ * first-event-timeout / network / other), computes the window error rate,
+ * attributes to `upstreamProvider` or the explicit `unknown` bucket, and
+ * drives the flaky notice with the same once-per-slug dedup.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import {
 	buildRoutingTurnSample,
+	classifyRoutingError,
 	isOpenRouterBackfillCandidate,
+	isOpenRouterErrorBackfillCandidate,
+	ProviderHealthNotifier,
 	ROUTING_STATS_WINDOW,
 	RoutingStatsTracker,
+	routingErrorFromMessage,
 	routingSampleFromMessage,
-	SlowProviderNotifier,
+	UNKNOWN_PROVIDER_SLUG,
 } from "@oh-my-pi/pi-coding-agent/session/routing-stats";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -268,32 +276,265 @@ describe("routingSampleFromMessage / backfill candidacy", () => {
 	});
 });
 
-describe("SlowProviderNotifier", () => {
+describe("ProviderHealthNotifier slow notices", () => {
 	it("fires the notice once per slug when slow, then stays silent", () => {
 		const tracker = new RoutingStatsTracker({ hydrate: false });
-		const notifier = new SlowProviderNotifier();
+		const notifier = new ProviderHealthNotifier();
 		recordTurns(tracker, "anthropic", 3, slowSample());
 
-		const first = notifier.maybeNotify(tracker, "anthropic", THRESHOLDS);
+		const first = notifier.maybeNotifySlow(tracker, "anthropic", THRESHOLDS);
 		expect(first).toBe("anthropic slow (5.0 tok/s median) — /provider ignore anthropic to ban");
-		expect(notifier.maybeNotify(tracker, "anthropic", THRESHOLDS)).toBeUndefined();
+		expect(notifier.maybeNotifySlow(tracker, "anthropic", THRESHOLDS)).toBeUndefined();
 	});
 
 	it("stays silent for fast providers and under-populated windows", () => {
 		const tracker = new RoutingStatsTracker({ hydrate: false });
-		const notifier = new SlowProviderNotifier();
+		const notifier = new ProviderHealthNotifier();
 		recordTurns(tracker, "fast-one", 5, fastSample());
 		recordTurns(tracker, "new-one", 2, slowSample());
-		expect(notifier.maybeNotify(tracker, "fast-one", THRESHOLDS)).toBeUndefined();
-		expect(notifier.maybeNotify(tracker, "new-one", THRESHOLDS)).toBeUndefined();
+		expect(notifier.maybeNotifySlow(tracker, "fast-one", THRESHOLDS)).toBeUndefined();
+		expect(notifier.maybeNotifySlow(tracker, "new-one", THRESHOLDS)).toBeUndefined();
 	});
 
 	it("reset() re-arms a slug", () => {
 		const tracker = new RoutingStatsTracker({ hydrate: false });
-		const notifier = new SlowProviderNotifier();
+		const notifier = new ProviderHealthNotifier();
 		recordTurns(tracker, "anthropic", 3, slowSample());
-		expect(notifier.maybeNotify(tracker, "anthropic", THRESHOLDS)).toBeDefined();
+		expect(notifier.maybeNotifySlow(tracker, "anthropic", THRESHOLDS)).toBeDefined();
 		notifier.reset("anthropic");
-		expect(notifier.maybeNotify(tracker, "anthropic", THRESHOLDS)).toBeDefined();
+		expect(notifier.maybeNotifySlow(tracker, "anthropic", THRESHOLDS)).toBeDefined();
+	});
+});
+
+describe("classifyRoutingError", () => {
+	it("classifies the idle-watchdog abort as stream-stall", () => {
+		expect(classifyRoutingError("OpenAI responses stream stalled while waiting for the next event")).toBe(
+			"stream-stall",
+		);
+		expect(classifyRoutingError("Provider stream stalled while waiting for the next event")).toBe("stream-stall");
+	});
+
+	it("classifies the first-event watchdog as first-event-timeout", () => {
+		expect(classifyRoutingError("OpenAI responses stream timed out while waiting for the first event")).toBe(
+			"first-event-timeout",
+		);
+		expect(classifyRoutingError("Anthropic stream timed out while waiting for the first event")).toBe(
+			"first-event-timeout",
+		);
+	});
+
+	it("classifies mid-stream transport closes as truncated-stream", () => {
+		expect(classifyRoutingError("OpenAI responses stream closed before a terminal response event was received")).toBe(
+			"truncated-stream",
+		);
+		expect(
+			classifyRoutingError(
+				"Google API stream ended without a finish reason (connection dropped or response truncated)",
+			),
+		).toBe("truncated-stream");
+	});
+
+	it("classifies connection-level failures as network", () => {
+		expect(classifyRoutingError("server_error: Network connection lost")).toBe("network");
+		expect(classifyRoutingError("fetch failed")).toBe("network");
+	});
+
+	it("keeps the user-visible stall and network classes distinct", () => {
+		expect(classifyRoutingError("OpenAI responses stream stalled while waiting for the next event")).not.toBe(
+			classifyRoutingError("server_error: Network connection lost"),
+		);
+	});
+
+	it("falls back to other for unrecognized or missing messages", () => {
+		expect(classifyRoutingError("500 Internal Server Error")).toBe("other");
+		expect(classifyRoutingError(undefined)).toBe("other");
+	});
+});
+
+describe("RoutingStatsTracker error channel", () => {
+	it("computes the error rate over successes plus errors in the window", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		recordTurns(tracker, "deepinfra", 7, fastSample());
+		tracker.recordError("deepinfra", "stream-stall");
+		tracker.recordError("deepinfra", "stream-stall");
+		tracker.recordError("deepinfra", "network");
+		const summary = tracker.getSummary("deepinfra");
+		expect(summary?.turns).toBe(7);
+		expect(summary?.errors).toBe(3);
+		expect(summary?.errorRate).toBeCloseTo(0.3);
+		expect(summary?.errorCounts).toEqual({ "stream-stall": 2, network: 1 });
+	});
+
+	it("surfaces error-only slugs with zero success turns", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		tracker.recordError("deepinfra", "other");
+		const summary = tracker.getSummary("deepinfra");
+		expect(summary?.turns).toBe(0);
+		expect(summary?.errors).toBe(1);
+		expect(summary?.errorRate).toBe(1);
+		expect(tracker.summaries().map(s => s.slug)).toEqual(["deepinfra"]);
+	});
+
+	it("caps the error channel at the rolling window", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		for (let i = 0; i < ROUTING_STATS_WINDOW + 5; i++) tracker.recordError("deepinfra", "network");
+		expect(tracker.getSummary("deepinfra")?.errors).toBe(ROUTING_STATS_WINDOW);
+	});
+});
+
+describe("RoutingStatsTracker flaky detection", () => {
+	const FLAKY = { minErrors: 3, minErrorRate: 0.3 };
+
+	it("flags a slug once errors pass both thresholds", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		recordTurns(tracker, "deepinfra", 7, fastSample());
+		for (let i = 0; i < 3; i++) tracker.recordError("deepinfra", "stream-stall");
+		expect(tracker.isFlaky("deepinfra", FLAKY)).toBe(true);
+		expect(tracker.flakyReason("deepinfra", FLAKY)).toBe("3 stream stalls in 10 turns");
+	});
+
+	it("stays silent below the minimum error count", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		tracker.recordError("deepinfra", "stream-stall");
+		tracker.recordError("deepinfra", "stream-stall");
+		expect(tracker.isFlaky("deepinfra", FLAKY)).toBe(false);
+	});
+
+	it("stays silent below the error-rate threshold even with enough errors", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		recordTurns(tracker, "deepinfra", 17, fastSample());
+		for (let i = 0; i < 3; i++) tracker.recordError("deepinfra", "stream-stall");
+		expect(tracker.isFlaky("deepinfra", FLAKY)).toBe(false);
+	});
+
+	it("names the dominant error class and singularizes a single occurrence", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		recordTurns(tracker, "deepinfra", 1, fastSample());
+		tracker.recordError("deepinfra", "network");
+		expect(tracker.flakyReason("deepinfra", { minErrors: 1, minErrorRate: 0.3 })).toBe("1 network error in 2 turns");
+	});
+});
+
+describe("routingErrorFromMessage / error backfill candidacy", () => {
+	const baseError = {
+		upstreamProvider: "deepinfra",
+		provider: "openrouter",
+		stopReason: "error",
+		errorMessage: "OpenAI responses stream stalled while waiting for the next event",
+	};
+
+	it("attributes an errored turn to its upstreamProvider", () => {
+		const recorded = routingErrorFromMessage(baseError);
+		expect(recorded?.slug).toBe("deepinfra");
+		expect(recorded?.sample.class).toBe("stream-stall");
+	});
+
+	it("records unattributed errors under the explicit unknown bucket", () => {
+		const recorded = routingErrorFromMessage({ ...baseError, upstreamProvider: undefined });
+		expect(recorded?.slug).toBe(UNKNOWN_PROVIDER_SLUG);
+		expect(recorded?.sample.class).toBe("stream-stall");
+	});
+
+	it("ignores non-error turns", () => {
+		expect(routingErrorFromMessage({ ...baseError, stopReason: "stop" })).toBeUndefined();
+		expect(routingErrorFromMessage({ ...baseError, stopReason: "aborted" })).toBeUndefined();
+	});
+
+	it("marks gen-id errored OpenRouter turns without attribution as backfill candidates", () => {
+		expect(
+			isOpenRouterErrorBackfillCandidate({ ...baseError, upstreamProvider: undefined, responseId: "gen-123-abc" }),
+		).toBe(true);
+		expect(isOpenRouterErrorBackfillCandidate(baseError)).toBe(false); // already attributed
+		expect(isOpenRouterErrorBackfillCandidate({ ...baseError, stopReason: "stop" })).toBe(false); // not an error
+		expect(
+			isOpenRouterErrorBackfillCandidate({
+				...baseError,
+				upstreamProvider: undefined,
+				responseId: "gen-1",
+				provider: "openai",
+			}),
+		).toBe(false);
+	});
+});
+
+describe("RoutingStatsTracker error persistence", () => {
+	it("round-trips the error channel through the stats file", async () => {
+		tempDir = TempDir.createSync("@pi-routing-stats-");
+		const filePath = tempDir.join("routing-stats.json");
+		const first = new RoutingStatsTracker({ persistPath: filePath, saveThrottleMs: 0 });
+		await first.ready;
+		recordTurns(first, "deepinfra", 7, fastSample());
+		first.recordError("deepinfra", "stream-stall");
+		first.recordError("deepinfra", "network");
+		first.recordError(UNKNOWN_PROVIDER_SLUG, "first-event-timeout");
+		await first.flush();
+
+		const second = new RoutingStatsTracker({ persistPath: filePath });
+		await second.ready;
+		const summary = second.getSummary("deepinfra");
+		expect(summary?.turns).toBe(7);
+		expect(summary?.errors).toBe(2);
+		expect(summary?.errorCounts).toEqual({ "stream-stall": 1, network: 1 });
+		expect(second.getSummary(UNKNOWN_PROVIDER_SLUG)?.errors).toBe(1);
+	});
+
+	it("drops malformed persisted error entries", async () => {
+		tempDir = TempDir.createSync("@pi-routing-stats-");
+		const filePath = tempDir.join("routing-stats.json");
+		await Bun.write(
+			filePath,
+			JSON.stringify({
+				version: 1,
+				providers: {
+					deepinfra: { samples: [], errors: [{ class: "network" }, "stream-stall", { class: "bogus" }, 42] },
+				},
+			}),
+		);
+		const tracker = new RoutingStatsTracker({ persistPath: filePath });
+		await tracker.ready;
+		expect(tracker.getSummary("deepinfra")?.errorCounts).toEqual({ network: 1, "stream-stall": 1 });
+	});
+});
+
+describe("ProviderHealthNotifier flaky notices", () => {
+	const FLAKY = { minErrors: 3, minErrorRate: 0.3 };
+
+	it("fires the erroring notice once per slug, pointing at /provider ignore", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		const notifier = new ProviderHealthNotifier();
+		recordTurns(tracker, "deepinfra", 7, fastSample());
+		for (let i = 0; i < 3; i++) tracker.recordError("deepinfra", "stream-stall");
+
+		const first = notifier.maybeNotifyFlaky(tracker, "deepinfra", FLAKY);
+		expect(first).toBe("deepinfra erroring (3 stream stalls in 10 turns) — /provider ignore deepinfra to ban");
+		expect(notifier.maybeNotifyFlaky(tracker, "deepinfra", FLAKY)).toBeUndefined();
+	});
+
+	it("stays silent below the thresholds and re-arms on reset()", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		const notifier = new ProviderHealthNotifier();
+		recordTurns(tracker, "deepinfra", 18, fastSample());
+		for (let i = 0; i < 2; i++) tracker.recordError("deepinfra", "stream-stall");
+		expect(notifier.maybeNotifyFlaky(tracker, "deepinfra", FLAKY)).toBeUndefined();
+
+		tracker.recordError("deepinfra", "stream-stall"); // 3 errors / 21 turns still below 0.3
+		expect(notifier.maybeNotifyFlaky(tracker, "deepinfra", FLAKY)).toBeUndefined();
+
+		for (let i = 0; i < 4; i++) tracker.recordError("deepinfra", "stream-stall"); // 7/25 = 0.28, still below
+		expect(notifier.maybeNotifyFlaky(tracker, "deepinfra", FLAKY)).toBeUndefined();
+
+		for (let i = 0; i < 4; i++) tracker.recordError("deepinfra", "stream-stall"); // 11/29 ≈ 0.38, flaky
+		expect(notifier.maybeNotifyFlaky(tracker, "deepinfra", FLAKY)).toBeDefined();
+		notifier.reset("deepinfra");
+		expect(notifier.maybeNotifyFlaky(tracker, "deepinfra", FLAKY)).toBeDefined();
+	});
+
+	it("never notifies for the unknown bucket", () => {
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		const notifier = new ProviderHealthNotifier();
+		for (let i = 0; i < 5; i++) tracker.recordError(UNKNOWN_PROVIDER_SLUG, "other");
+		expect(
+			notifier.maybeNotifyFlaky(tracker, UNKNOWN_PROVIDER_SLUG, { minErrors: 1, minErrorRate: 0 }),
+		).toBeUndefined();
 	});
 });

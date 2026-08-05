@@ -108,18 +108,20 @@ async function buildProviderTable(deps: ProviderCommandDeps): Promise<string> {
 	if (summaries.length === 0 && ignoredWithoutStats.length === 0) {
 		lines.push("No upstream provider turns recorded yet.");
 	} else {
-		const header = `${"slug".padEnd(SLUG_COLUMN_WIDTH)}  turns  tok/s med  ttft p50  OR tok/s  OR lat p50  flags`;
+		const header = `${"slug".padEnd(SLUG_COLUMN_WIDTH)}  turns  errs  err rate  tok/s med  ttft p50  OR tok/s  OR lat p50  flags`;
 		lines.push(header);
 		for (const summary of summaries) {
 			const remote = endpointIndex?.get(summary.slug.toLowerCase());
 			const flags = ignore.includes(summary.slug) ? "ignored" : "";
+			const errs = summary.errors > 0 ? String(summary.errors) : "-";
+			const errRate = summary.errors > 0 ? `${Math.round(summary.errorRate * 100)}%` : "-";
 			lines.push(
-				`${sanitizeSlug(summary.slug).padEnd(SLUG_COLUMN_WIDTH)}  ${String(summary.turns).padStart(5)}  ${formatTokensPerSecond(summary.medianTokensPerSecond).padStart(9)}  ${formatMs(summary.ttftP50Ms).padStart(8)}  ${formatTokensPerSecond(remote?.throughputP50).padStart(8)}  ${formatMs(remote?.latencyP50Ms).padStart(10)}  ${flags}`,
+				`${sanitizeSlug(summary.slug).padEnd(SLUG_COLUMN_WIDTH)}  ${String(summary.turns).padStart(5)}  ${errs.padStart(4)}  ${errRate.padStart(8)}  ${formatTokensPerSecond(summary.medianTokensPerSecond).padStart(9)}  ${formatMs(summary.ttftP50Ms).padStart(8)}  ${formatTokensPerSecond(remote?.throughputP50).padStart(8)}  ${formatMs(remote?.latencyP50Ms).padStart(10)}  ${flags}`,
 			);
 		}
 		for (const slug of ignoredWithoutStats) {
 			lines.push(
-				`${sanitizeSlug(slug).padEnd(SLUG_COLUMN_WIDTH)}  ${"-".padStart(5)}  ${"-".padStart(9)}  ${"-".padStart(8)}  ${"-".padStart(8)}  ${"-".padStart(10)}  ignored`,
+				`${sanitizeSlug(slug).padEnd(SLUG_COLUMN_WIDTH)}  ${"-".padStart(5)}  ${"-".padStart(4)}  ${"-".padStart(8)}  ${"-".padStart(9)}  ${"-".padStart(8)}  ${"-".padStart(8)}  ${"-".padStart(10)}  ignored`,
 			);
 		}
 	}

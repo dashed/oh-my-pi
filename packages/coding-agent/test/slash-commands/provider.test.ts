@@ -164,6 +164,35 @@ describe("/provider table", () => {
 		expect(vertex).toContain("ignored");
 	});
 
+	it("renders the rolling error count and rate columns", async () => {
+		const settings = Settings.isolated();
+		const tracker = new RoutingStatsTracker({ hydrate: false });
+		for (let i = 0; i < 8; i++) tracker.record("deepinfra", { tokensPerSecond: 40, ttftMs: 200 });
+		tracker.recordError("deepinfra", "stream-stall");
+		tracker.recordError("deepinfra", "stream-stall");
+		tracker.recordError("unknown", "first-event-timeout");
+		const text = await runProviderCommand("", {
+			settings,
+			session: { settings, model: undefined } as unknown as SlashCommandRuntime["session"],
+			tracker,
+		});
+
+		const lines = text.split("\n");
+		const header = lines.find(line => line.startsWith("slug"));
+		expect(header).toContain("errs");
+		expect(header).toContain("err rate");
+		// 2 errors over 8 successes + 2 errors → 20%.
+		const deepinfra = lines.find(line => line.startsWith("deepinfra"));
+		expect(deepinfra).toBeDefined();
+		expect(deepinfra).toContain("2");
+		expect(deepinfra).toContain("20%");
+		// The explicit unknown bucket renders its own row.
+		const unknown = lines.find(line => line.startsWith("unknown"));
+		expect(unknown).toBeDefined();
+		expect(unknown).toContain("1");
+		expect(unknown).toContain("100%");
+	});
+
 	it("renders configured routing preferences in the header line", async () => {
 		const settings = Settings.isolated();
 		settings.set("providers.openrouter.sort", "throughput");
