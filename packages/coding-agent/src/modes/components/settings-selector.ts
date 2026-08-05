@@ -44,6 +44,7 @@ import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
+import { editorKeyFirst } from "./keybinding-hints";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingDef, getSettingsForTab, type SettingDef } from "./settings-defs";
@@ -177,9 +178,12 @@ class SelectSubmenu extends Container {
 
 		this.addChild(this.#selectList);
 
-		// Hint
+		// Hint — SelectList's confirm/cancel are registry keybindings, so their
+		// labels come from the live keybinding map (first key only, to stay compact).
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Enter to select · Esc to go back"), 0, 0));
+		const confirmLabel = editorKeyFirst("tui.select.confirm") || "Enter";
+		const cancelLabel = editorKeyFirst("tui.select.cancel") || "Esc";
+		this.addChild(new Text(theme.fg("dim", `  ${confirmLabel} to select · ${cancelLabel} to go back`), 0, 0));
 
 		// Footer (e.g. the snapcompact shape preview) below the interactive rows,
 		// so the list never shifts while browsing.
@@ -609,17 +613,22 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	#footerHintText(): string {
+		// Confirm/cancel route through the registry (SelectList / tui.select.*), so
+		// their labels track the live keybinding map; Tab/arrows/Space are
+		// component-level keys, shown raw.
+		const confirmLabel = editorKeyFirst("tui.select.confirm") || "Enter";
+		const cancelLabel = editorKeyFirst("tui.select.cancel") || "Esc";
 		if (this.#searchList) {
-			return "Enter to change · Tab to jump tabs · Esc to exit search";
+			return `${confirmLabel} to change · Tab to jump tabs · ${cancelLabel} to exit search`;
 		}
 		if (this.#currentTabId === "plugins") {
-			return "Tab to switch tabs · Esc to close";
+			return `Tab to switch tabs · ${cancelLabel} to close`;
 		}
 		if (this.#currentList?.sectionFocused) {
-			return "↑/↓ to jump sections · Tab/Enter to settings · ←/→ to switch tabs · Esc to close";
+			return `↑/↓ to jump sections · Tab/${confirmLabel} to settings · ←/→ to switch tabs · ${cancelLabel} to close`;
 		}
 		const nav = this.#hasSectionJump ? "Tab to jump sections · ←/→ to switch tabs" : "Tab to switch tabs";
-		return `Enter/Space to change · ${nav} · Type to search · Esc to close`;
+		return `${confirmLabel}/Space to change · ${nav} · Type to search · ${cancelLabel} to close`;
 	}
 
 	/** Single-line search banner: accent icon, editable query with live cursor, right-aligned match count. */

@@ -55,6 +55,7 @@ interface AppKeybindings {
 	"app.history.search": true;
 	"app.stt.toggle": true;
 	"app.live.toggle": true;
+	"app.help.hotkeys": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -233,6 +234,14 @@ export const KEYBINDINGS = {
 	"app.live.toggle": {
 		defaultKeys: "ctrl+l",
 		description: "Start or stop live voice mode (/live)",
+	},
+	"app.help.hotkeys": {
+		// F1 is the universal help key and parses from both legacy encodings.
+		// Ctrl+/ only arrives distinctly under the kitty keyboard protocol; in
+		// legacy terminals it is 0x1f, which parses as ctrl+_ and stays with
+		// tui.editor.undo, so it is listed second rather than stealing that key.
+		defaultKeys: ["f1", "ctrl+/"],
+		description: "Show keyboard shortcuts (/hotkeys)",
 	},
 } as const satisfies KeybindingDefinitions;
 

@@ -359,9 +359,9 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(lines[0]).toMatch(/^─+$/);
 		expect(lines.at(-1)).toMatch(/^─+$/);
 		expect(lines[4]?.startsWith("> ")).toBe(true);
-		expect(rendered).toContain("enter or ctrl+q submit  esc cancel");
+		expect(rendered).toContain("enter or Ctrl+Q/Ctrl+Enter submit  Esc cancel");
 		expect(rendered).not.toContain("shift+enter newline");
-		expect(rendered).toContain("ctrl+g external editor");
+		expect(rendered).toContain("Ctrl+G external editor");
 	});
 
 	it("anchors the hardware cursor while entering an Other response", () => {
@@ -441,7 +441,7 @@ describe("HookEditorComponent prompt-style mode", () => {
 
 		const titleRow = lines.find(line => line.includes("Enter your response:"));
 		const gutterRow = lines.find(line => line.startsWith("> "));
-		const hintRow = lines.find(line => line.includes("esc cancel"));
+		const hintRow = lines.find(line => line.includes("Esc cancel"));
 
 		expect(titleRow).toBeDefined();
 		expect(gutterRow).toBeDefined();

@@ -20,7 +20,7 @@ import {
 } from "../../modes/utils/keybinding-matchers";
 import type { HistoryEntry, HistoryStorage } from "../../session/history-storage";
 import { DynamicBorder } from "./dynamic-border";
-import { rawKeyHint } from "./keybinding-hints";
+import { editorKey, rawKeyHint } from "./keybinding-hints";
 import { centeredWindow, contentRowWidth, renderScrollableList } from "./selector-helpers";
 
 /** Visible result rows; also the jump distance for PageUp/PageDown. */
@@ -179,7 +179,16 @@ export class HistorySearchComponent extends Container {
 
 		const title = theme.bold(theme.fg("accent", `${theme.icon.rewind} Search History`));
 		const dot = theme.fg("dim", theme.sep.dot);
-		const hint = [rawKeyHint("↑↓", "navigate"), rawKeyHint("enter", "select"), rawKeyHint("esc", "cancel")].join(dot);
+		// Navigate/cancel route through the registry (matchesSelectUp/Down /
+		// matchesAppInterrupt), so their labels track the live keybinding map;
+		// Enter is a component-level confirm, shown raw.
+		const upDownLabel = `${editorKey("tui.select.up")}/${editorKey("tui.select.down")}`;
+		const cancelLabel = editorKey("app.interrupt") || "Esc";
+		const hint = [
+			rawKeyHint(upDownLabel, "navigate"),
+			rawKeyHint("Enter", "select"),
+			rawKeyHint(cancelLabel, "cancel"),
+		].join(dot);
 
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(title, 1, 0));

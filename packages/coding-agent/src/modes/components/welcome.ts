@@ -1,5 +1,6 @@
 import {
 	type Component,
+	getKeybindings,
 	padding,
 	replaceTabs,
 	TERMINAL,
@@ -8,6 +9,7 @@ import {
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
+import { formatKeyHints } from "../../config/keybindings";
 import { theme } from "../../modes/theme/theme";
 import tipsText from "./tips.txt" with { type: "text" };
 
@@ -325,6 +327,10 @@ export class WelcomeComponent implements Component {
 			lspLines.push("");
 		}
 
+		// Shortcuts hint uses the live label of the app.help.hotkeys binding so
+		// rebinds are reflected; the slash command is the fallback when unbound.
+		const hotkeysLabel = formatKeyHints(getKeybindings().getKeys("app.help.hotkeys")) || "/hotkeys";
+
 		// Right column
 		const rightLines = [
 			` ${theme.bold(theme.fg("accent", "Tips"))}`,
@@ -332,6 +338,7 @@ export class WelcomeComponent implements Component {
 			` ${theme.fg("dim", "/")}${theme.fg("muted", " for commands")}`,
 			` ${theme.fg("dim", "!")}${theme.fg("muted", " to run bash")}`,
 			` ${theme.fg("dim", "$")}${theme.fg("muted", " to run python")}`,
+			` ${theme.fg("dim", hotkeysLabel)}${theme.fg("muted", " for shortcuts")}`,
 			separator,
 			` ${theme.bold(theme.fg("accent", "LSP Servers"))}`,
 			...lspLines,

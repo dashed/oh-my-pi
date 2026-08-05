@@ -59,6 +59,33 @@ describe("component escape bindings", () => {
 		expect(onExit).toHaveBeenCalledTimes(1);
 	});
 
+	it("reflects rebound confirm and interrupt keys in the session selector footer", () => {
+		const rowsDesc = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+		Object.defineProperty(process.stdout, "rows", { configurable: true, get: () => 24, set: () => {} });
+		try {
+			setKeybindings(KeybindingsManager.inMemory({ "tui.select.confirm": "o", "app.interrupt": "alt+x" }));
+
+			const selector = new SessionSelectorComponent(
+				[createSession("session-a", "Alpha")],
+				() => {},
+				() => {},
+				() => {},
+			);
+
+			const footer = selector
+				.render(120)
+				.map(line => Bun.stripANSI(line))
+				.find(line => line.includes("cancel"));
+			expect(footer).toBeDefined();
+			expect(footer).toContain("O select");
+			expect(footer).toContain("Alt+X cancel");
+			expect(footer).not.toContain("Enter select");
+			expect(footer).not.toContain("Esc cancel");
+		} finally {
+			if (rowsDesc) Object.defineProperty(process.stdout, "rows", rowsDesc);
+		}
+	});
+
 	it("uses tui.select.cancel for model selector cancellation", () => {
 		const keybindings = KeybindingsManager.inMemory({
 			"tui.select.cancel": "ctrl+g",

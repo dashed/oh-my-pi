@@ -14,6 +14,7 @@
 
 ### Added
 
+- Surface keyboard shortcuts in the UI: contextual footer hints across the agent hub, selectors, dialogs, and editors now render labels from the live keybinding registry, so custom rebinds are reflected; open the full shortcuts panel with `f1` or `ctrl+/` (also `/hotkeys`); welcome splash now hints at it.
 - Show a live elapsed-time timer for running subagents in the Agent Hub rows and inline task transcript rows.
 - Show the tool currently in flight and the accrued run cost on running Agent Hub rows, and a `· <tool>` suffix on Subagents HUD rows.
 - Raise a desktop notification when a subagent reaches a terminal state (completed, failed, or aborted), gated by the existing `completion.notify` / `error.notify` settings.

@@ -16,6 +16,7 @@ import {
 } from "../../modes/utils/keybinding-matchers";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { DynamicBorder } from "./dynamic-border";
+import { editorKey } from "./keybinding-hints";
 
 export interface HookEditorOptions {
 	/** When true, use prompt-style keybindings with the legacy ask prompt chrome. */
@@ -83,10 +84,15 @@ export class HookEditorComponent extends Container implements Focusable {
 
 		this.addChild(new Spacer(1));
 
-		// Hint
+		// Hint — every action here is registry-backed (matchesAppFollowUp /
+		// matchesAppInterrupt / matchesAppExternalEditor), so labels come from the
+		// live keybinding map; prompt-style's raw Enter submit stays raw.
+		const followUpLabel = editorKey("app.message.followUp") || "Ctrl+Q/Ctrl+Enter";
+		const cancelLabel = editorKey("app.interrupt") || "Esc";
+		const externalLabel = editorKey("app.editor.external") || "Ctrl+G";
 		const hint = this.#promptStyle
-			? "enter or ctrl+q submit  esc cancel  ctrl+g external editor"
-			: "ctrl+q/ctrl+enter submit  esc cancel  ctrl+g external editor";
+			? `enter or ${followUpLabel} submit  ${cancelLabel} cancel  ${externalLabel} external editor`
+			: `${followUpLabel} submit  ${cancelLabel} cancel  ${externalLabel} external editor`;
 		this.addChild(new Text(theme.fg("dim", hint), chromePadX, 0));
 
 		this.addChild(new Spacer(1));

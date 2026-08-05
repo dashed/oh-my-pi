@@ -21,6 +21,11 @@ export function matchesSelectCancel(data: string): boolean {
 	return getKeybindings().matches(data, "tui.select.cancel");
 }
 
+/** Match the generic selector confirm keybinding. */
+export function matchesSelectConfirm(data: string): boolean {
+	return getKeybindings().matches(data, "tui.select.confirm");
+}
+
 /** Match the generic selector up-navigation keybinding. */
 export function matchesSelectUp(data: string): boolean {
 	return getKeybindings().matches(data, "tui.select.up");

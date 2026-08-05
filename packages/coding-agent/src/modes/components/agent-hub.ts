@@ -27,9 +27,15 @@ import { parseThinkingLevel } from "../../thinking";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { theme } from "../theme/theme";
-import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
+import {
+	matchesAppInterrupt,
+	matchesSelectConfirm,
+	matchesSelectDown,
+	matchesSelectUp,
+} from "../utils/keybinding-matchers";
 import { AgentTranscriptViewer } from "./agent-transcript-viewer";
 import { DynamicBorder } from "./dynamic-border";
+import { editorKey, keyHint, rawKeyHint } from "./keybinding-hints";
 
 /** Refresh cadence for the relative-time column */
 const AGE_TICK_MS = 5_000;
@@ -474,7 +480,17 @@ export class AgentHubOverlayComponent extends Container {
 			lines.push(` ${theme.fg("error", sanitizeLine(this.#notice, Math.max(10, width - 2)))}`);
 		}
 		lines.push("");
-		lines.push(` ${theme.fg("dim", "j/k:select  Enter:open  r:revive  x:kill  Esc/←←:close")}`);
+		// j/k/r/x are component-level table keys (#handleTableInput), so they stay
+		// raw; open/close labels come from the live keybinding map.
+		const closeLabel = `${editorKey("app.interrupt") || "Esc"}/←←`;
+		const footer = [
+			rawKeyHint("j/k", "select"),
+			keyHint("tui.select.confirm", "open"),
+			rawKeyHint("r", "revive"),
+			rawKeyHint("x", "kill"),
+			rawKeyHint(closeLabel, "close"),
+		].join(theme.fg("dim", "  "));
+		lines.push(` ${footer}`);
 		lines.push(...new DynamicBorder().render(width));
 		return lines;
 	}
@@ -555,7 +571,7 @@ export class AgentHubOverlayComponent extends Container {
 	}
 
 	#handleTableInput(keyData: string): void {
-		if (matchesKey(keyData, "escape")) {
+		if (matchesAppInterrupt(keyData)) {
 			this.#onDone();
 			return;
 		}
@@ -583,7 +599,7 @@ export class AgentHubOverlayComponent extends Container {
 			this.#requestRender();
 			return;
 		}
-		if (matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") {
+		if (matchesSelectConfirm(keyData) || keyData === "\r" || keyData === "\n") {
 			const selected = this.#rows[this.#selectedRow];
 			if (selected) this.#activateAgent(selected);
 			return;

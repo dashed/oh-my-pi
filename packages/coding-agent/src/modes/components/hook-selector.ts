@@ -29,6 +29,7 @@ import {
 } from "../../modes/utils/keybinding-matchers";
 import { CountdownTimer } from "./countdown-timer";
 import { DynamicBorder } from "./dynamic-border";
+import { editorKeyFirst } from "./keybinding-hints";
 import { renderSegmentTrack } from "./segment-track";
 
 /** One segment of a {@link HookSelectorSlider} — a label and an optional
@@ -262,7 +263,11 @@ export class HookSelectorComponent extends Container {
 			this.addChild(this.#listContainer);
 		}
 		this.addChild(new Spacer(1));
-		const controlsHint = opts?.helpText ?? "up/down navigate  enter select  esc cancel";
+		// Navigate/cancel route through the registry (matchesSelectUp/Down/Cancel),
+		// so their labels track the live keybinding map; Enter is a component-level
+		// confirm, shown raw.
+		const defaultHint = `${editorKeyFirst("tui.select.up")}/${editorKeyFirst("tui.select.down")} navigate  enter select  ${editorKeyFirst("tui.select.cancel") || "Esc"} cancel`;
+		const controlsHint = opts?.helpText ?? defaultHint;
 		this.addChild(new Text(theme.fg("dim", controlsHint), 1, 0));
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());

@@ -75,6 +75,32 @@ describe("CustomEditor keybindings", () => {
 	});
 });
 
+describe("shipped help defaults", () => {
+	it("binds f1 and ctrl+/ to the hotkeys panel", () => {
+		const keybindings = KeybindingsManager.inMemory();
+		expect(keybindings.getKeys("app.help.hotkeys")).toEqual(["f1", "ctrl+/"]);
+	});
+
+	it("routes the shipped f1 default through a custom handler without eating '?' text", () => {
+		// input-controller wires app.help.hotkeys via setCustomKeyHandler; drive the
+		// editor the same way. F1 (legacy SS3 encoding) opens the panel, while '?'
+		// stays plain text — the UX guard that ruled out a bare-'?' default.
+		const editor = new CustomEditor(getEditorTheme());
+		const onHotkeys = vi.fn();
+		for (const key of KeybindingsManager.inMemory().getKeys("app.help.hotkeys")) {
+			editor.setCustomKeyHandler(key, onHotkeys);
+		}
+
+		editor.handleInput("\x1bOP"); // F1
+		expect(onHotkeys).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+
+		editor.handleInput("?");
+		expect(onHotkeys).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("?");
+	});
+});
+
 describe("shipped dequeue defaults", () => {
 	it("binds both alt+up and shift+up to the steering dequeue", () => {
 		const keybindings = KeybindingsManager.inMemory();

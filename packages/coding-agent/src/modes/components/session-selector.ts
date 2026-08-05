@@ -15,11 +15,17 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import { theme } from "../../modes/theme/theme";
-import { matchesAppInterrupt, matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
+import {
+	matchesAppInterrupt,
+	matchesSelectConfirm,
+	matchesSelectDown,
+	matchesSelectUp,
+} from "../../modes/utils/keybinding-matchers";
 import type { SessionInfo, SessionStatus } from "../../session/session-listing";
 import { shortenPath } from "../../tools/render-utils";
 import { DynamicBorder } from "./dynamic-border";
 import { HookSelectorComponent } from "./hook-selector";
+import { editorKey } from "./keybinding-hints";
 
 /**
  * Themed glyph + colored label for a session's lifecycle status, or `undefined`
@@ -686,8 +692,8 @@ class SessionList implements Component {
 			this.#selectedIndex = Math.min(this.#filteredSessions.length - 1, this.#selectedIndex + this.#visibleCount());
 			return;
 		}
-		// Enter
-		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+		// Enter (tui.select.confirm; raw LF covers terminals that report unmodified Enter as LF)
+		if (matchesSelectConfirm(keyData) || keyData === "\n") {
 			const selected = this.#filteredSessions[this.#selectedIndex];
 			if (selected && this.onSelect) {
 				this.onSelect(selected);
@@ -992,7 +998,14 @@ export class SessionSelectorComponent extends Container {
 	/** Blank · keybinding hint · bottom border. Rendered by {@link render}. */
 	#footerLines(width: number): string[] {
 		const scopeHint = this.#scope === "all" ? "current folder" : "all projects";
-		const hint = theme.fg("muted", `  [Del/⌫ delete · Enter select · Tab ${scopeHint} · Esc cancel]`);
+		// Confirm/cancel labels track the live keybinding map; delete and the Tab
+		// scope toggle are component-level keys, shown raw.
+		const confirmLabel = editorKey("tui.select.confirm") || "Enter";
+		const cancelLabel = editorKey("app.interrupt") || "Esc";
+		const hint = theme.fg(
+			"muted",
+			`  [Del/⌫ delete · ${confirmLabel} select · Tab ${scopeHint} · ${cancelLabel} cancel]`,
+		);
 		return ["", hint, "", ...this.#bottomBorder.render(width)];
 	}
 

@@ -60,6 +60,7 @@ import {
 	matchesSelectUp,
 } from "../utils/keybinding-matchers";
 import { DynamicBorder } from "./dynamic-border";
+import { editorKey } from "./keybinding-hints";
 import { clampSelection, handleTabSwitchKey, padLinesToHeight, searchableChar } from "./selector-helpers";
 
 type SourceTabId = "all" | AgentSource;
@@ -950,9 +951,14 @@ export class AgentDashboard extends Container {
 			this.addChild(new Text(theme.fg("error", replaceTabs(this.#createError)), 0, 0));
 		}
 		this.addChild(new Spacer(1));
+		// Generate/cancel route through the registry (matchesAppFollowUp /
+		// matchesAppInterrupt), so their labels track the live keybinding map;
+		// Enter (newline) and Tab (scope) are component-level, shown raw.
+		const followUpLabel = editorKey("app.message.followUp") || "Ctrl+Q/Ctrl+Enter";
+		const cancelLabel = editorKey("app.interrupt") || "Esc";
 		const hints = this.#createGenerating
 			? " Generating..."
-			: " Ctrl+Q/Ctrl+Enter: generate  Enter: newline  Tab: toggle scope  Esc: cancel";
+			: ` ${followUpLabel}: generate  Enter: newline  Tab: toggle scope  ${cancelLabel}: cancel`;
 		this.addChild(new Text(theme.fg("dim", hints), 0, 0));
 	}
 

@@ -2,7 +2,7 @@
  * Utilities for formatting keybinding hints in the UI.
  */
 import { getKeybindings, type Keybinding } from "@oh-my-pi/pi-tui";
-import { type AppKeybinding, formatKeyHints, type KeybindingsManager } from "../../config/keybindings";
+import { type AppKeybinding, formatKeyHint, formatKeyHints, type KeybindingsManager } from "../../config/keybindings";
 import { theme } from "../../modes/theme/theme";
 
 /**
@@ -10,6 +10,16 @@ import { theme } from "../../modes/theme/theme";
  */
 export function editorKey(action: Keybinding): string {
 	return formatKeyHints(getKeybindings().getKeys(action));
+}
+
+/**
+ * Compact variant of {@link editorKey} showing only the first bound key — for
+ * footers where a multi-key label like `Esc/Ctrl+C` would dominate the hint.
+ * A user rebind replaces the whole key list, so the first key still tracks it.
+ */
+export function editorKeyFirst(action: Keybinding): string {
+	const [first] = getKeybindings().getKeys(action);
+	return first === undefined ? "" : formatKeyHint(first);
 }
 
 /**
