@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { streamAzureOpenAIResponses } from "@oh-my-pi/pi-ai/providers/azure-openai-responses";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type {
 	AssistantMessageEvent,
@@ -8,6 +9,7 @@ import type {
 	Model,
 	ProviderSessionState,
 } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
@@ -146,6 +148,25 @@ function createCompletedTextResponse(text: string, responseId: string): Response
 			},
 		},
 		{ type: "response.completed", response: { id: responseId, status: "completed" } },
+	]);
+}
+
+/** Text deltas, then a clean EOF with no terminal response event — a text-only truncated attempt. */
+function createTruncatedTextResponse(text: string, responseId: string): Response {
+	return createSseResponse([
+		{ type: "response.created", response: { id: responseId, status: "in_progress" } },
+		{
+			type: "response.output_item.added",
+			output_index: 0,
+			item: { type: "message", id: `msg_${responseId}`, role: "assistant", status: "in_progress", content: [] },
+		},
+		{
+			type: "response.content_part.added",
+			output_index: 0,
+			item_id: `msg_${responseId}`,
+			part: { type: "output_text", text: "" },
+		},
+		{ type: "response.output_text.delta", output_index: 0, item_id: `msg_${responseId}`, delta: text },
 	]);
 }
 
@@ -415,14 +436,19 @@ describe("OpenAI Responses transient stream retry", () => {
 		await gated.terminalRequested;
 		const observedBeforeTerminal = await nonTerminalEvents;
 		const deltaText = { type: "text", text: "draft", textSignature: JSON.stringify({ v: 1, id: "msg_live" }) };
+		// Text deltas are buffered until the first replay-unsafe event
+		// (`output_item.done` here) so a discarded attempt stays invisible; by the
+		// time the drained `text_end` snapshot is taken, the partial already
+		// carries the freshly registered (still empty) tool call block.
+		const pendingToolCall = { type: "toolCall", id: "call_live|fc_live", name: "read", arguments: {} };
 		expect(observedBeforeTerminal).toEqual([
 			{ type: "start", content: undefined },
 			{ type: "text_start", content: [deltaText] },
 			{ type: "text_delta", content: [deltaText] },
-			{ type: "text_end", content: [deltaText] },
+			{ type: "text_end", content: [deltaText, pendingToolCall] },
 			{
 				type: "toolcall_start",
-				content: [deltaText, { type: "toolCall", id: "call_live|fc_live", name: "read", arguments: {} }],
+				content: [deltaText, pendingToolCall],
 			},
 			{
 				type: "toolcall_delta",
@@ -442,6 +468,65 @@ describe("OpenAI Responses transient stream retry", () => {
 			name: "read",
 			arguments: { path: "README.md" },
 		});
+	});
+
+	it("retries a text-only truncated stream without leaking the discarded attempt", async () => {
+		let attempt = 0;
+		const fetchMock = vi.fn(async () => {
+			attempt++;
+			return attempt === 1
+				? createTruncatedTextResponse("Discarded partial", "resp_truncated")
+				: createCompletedTextResponse("Recovered answer", "resp_recovered");
+		}) as FetchImpl;
+
+		const responseStream = streamOpenAIResponses(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerRetryWait: async () => {},
+		});
+		const events = await collectEvents(responseStream);
+		const result = await responseStream.result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(result.stopReason).toBe("stop");
+		expect(events.map(event => event.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([
+			{
+				type: "text",
+				text: "Recovered answer",
+				textSignature: JSON.stringify({ v: 1, id: "msg_resp_recovered" }),
+			},
+		]);
+		expect(JSON.stringify(result.content)).not.toContain("Discarded partial");
+		expect(JSON.stringify(events)).not.toContain("Discarded partial");
+	});
+
+	it("surfaces a single error after a text-only truncation persists past the retry budget", async () => {
+		const fetchMock = vi.fn(async () =>
+			createTruncatedTextResponse("Uncommitted partial", "resp_truncated"),
+		) as FetchImpl;
+
+		const responseStream = streamOpenAIResponses(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerRetryWait: async () => {},
+		});
+		const events = await collectEvents(responseStream);
+		const result = await responseStream.result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("OpenAI responses stream closed before a terminal response event was received");
+		// The final attempt's buffered partial is forwarded ahead of the error so
+		// loop-level recovery sees committed output and refuses a blind replay.
+		expect(events.map(event => event.type)).toEqual(["start", "text_start", "text_delta", "error"]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([
+			{
+				type: "text",
+				text: "Uncommitted partial",
+				textSignature: JSON.stringify({ v: 1, id: "msg_resp_truncated" }),
+			},
+		]);
 	});
 
 	it("does not retry after a tool argument delta was emitted", async () => {
@@ -494,7 +579,7 @@ describe("OpenAI Responses transient stream retry", () => {
 		expect(result.stopReason).toBe("error");
 	});
 
-	it("bounds repeated pre-output stream corruption to one retry", async () => {
+	it("bounds repeated pre-output stream corruption to two retries", async () => {
 		const fetchMock = vi.fn(async () => createTruncatedPendingToolResponse()) as FetchImpl;
 
 		const result = await streamOpenAIResponses(model, context, {
@@ -503,7 +588,7 @@ describe("OpenAI Responses transient stream retry", () => {
 			providerRetryWait: async () => {},
 		}).result();
 
-		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
 		expect(result.stopReason).toBe("error");
 	});
 
@@ -561,4 +646,95 @@ describe("OpenAI Responses transient stream retry", () => {
 			expect(result.stopReason).toBe("error");
 		});
 	}
+});
+
+const azureModel: Model<"azure-openai-responses"> = buildModel({
+	id: "gpt-5-mini",
+	name: "GPT-5 Mini",
+	api: "azure-openai-responses",
+	provider: "azure",
+	baseUrl: "https://example.openai.azure.com/openai/v1",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 400000,
+	maxTokens: 128000,
+});
+
+describe("Azure OpenAI Responses transient stream retry", () => {
+	const azureOptions = (fetchMock: FetchImpl) => ({
+		apiKey: "test-key",
+		azureBaseUrl: azureModel.baseUrl,
+		azureApiVersion: "v1",
+		fetch: fetchMock,
+		providerRetryWait: async () => {},
+	});
+
+	it("retries a text-only truncated stream without leaking the discarded attempt", async () => {
+		let attempt = 0;
+		const fetchMock = vi.fn(async () => {
+			attempt++;
+			return attempt === 1
+				? createTruncatedTextResponse("Discarded azure partial", "resp_azure_truncated")
+				: createCompletedTextResponse("Recovered azure answer", "resp_azure_recovered");
+		}) as FetchImpl;
+
+		const responseStream = streamAzureOpenAIResponses(azureModel, context, azureOptions(fetchMock));
+		const events = await collectEvents(responseStream);
+		const result = await responseStream.result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(result.stopReason).toBe("stop");
+		expect(events.map(event => event.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
+		expect(JSON.stringify(result.content)).toContain("Recovered azure answer");
+		expect(JSON.stringify(result.content)).not.toContain("Discarded azure partial");
+		expect(JSON.stringify(events)).not.toContain("Discarded azure partial");
+	});
+
+	it("surfaces a single error after a text-only truncation persists past the retry budget", async () => {
+		const fetchMock = vi.fn(async () =>
+			createTruncatedTextResponse("Uncommitted azure partial", "resp_azure_truncated"),
+		) as FetchImpl;
+
+		const responseStream = streamAzureOpenAIResponses(azureModel, context, azureOptions(fetchMock));
+		const events = await collectEvents(responseStream);
+		const result = await responseStream.result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe(
+			"Azure OpenAI responses stream closed before a terminal response event was received",
+		);
+		expect(events.filter(event => event.type === "error")).toHaveLength(1);
+	});
+
+	it("does not retry after a tool argument delta was emitted", async () => {
+		const partialWithDelta = createSseResponse([
+			{ type: "response.created", response: { id: "resp_azure_partial", status: "in_progress" } },
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_azure_partial",
+					call_id: "call_azure_partial",
+					name: "read",
+					arguments: "",
+					status: "in_progress",
+				},
+			},
+			{
+				type: "response.function_call_arguments.delta",
+				output_index: 0,
+				item_id: "fc_azure_partial",
+				delta: '{"path":"README.md"}',
+			},
+		]);
+		const fetchMock = vi.fn(async () => partialWithDelta) as FetchImpl;
+
+		const result = await streamAzureOpenAIResponses(azureModel, context, azureOptions(fetchMock)).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+	});
 });

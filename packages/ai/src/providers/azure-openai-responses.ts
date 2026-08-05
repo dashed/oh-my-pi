@@ -1,4 +1,5 @@
-import { $env } from "@oh-my-pi/pi-utils";
+import { scheduler } from "node:timers/promises";
+import { $env, logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import type {
@@ -21,6 +22,7 @@ import {
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
+import { getHeadersFromError, getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
 import {
@@ -34,9 +36,12 @@ import {
 	applyCommonResponsesSamplingParams,
 	applyResponsesReasoningParams,
 	buildResponsesInput,
+	calculateOpenAIResponsesTransientStreamRetryDelayMs,
 	createInitialResponsesAssistantMessage,
 	getOpenAIPromptCacheKey,
 	isOpenAIResponsesProgressEvent,
+	isOpenAIResponsesReplayUnsafeEvent,
+	isRetryableOpenAIResponsesStreamFailure,
 	parseAzureDeploymentNameMap,
 	processResponsesStream,
 } from "./openai-shared";
@@ -46,6 +51,7 @@ export { parseAzureDeploymentNameMap } from "./openai-shared";
 const DEFAULT_AZURE_API_VERSION = "v1";
 const AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"Azure OpenAI responses stream timed out while waiting for the first event";
+const AZURE_OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES = 2;
 
 function resolveDeploymentName(model: Model<"azure-openai-responses">, options?: AzureOpenAIResponsesOptions): string {
 	if (options?.azureDeploymentName) {
@@ -143,7 +149,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				options?.streamFirstEventTimeoutMs ?? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs);
 			const requestTimeoutMs =
 				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
-			rawRequestDump = {
+			const activeRawRequestDump: RawHttpRequestDump = {
 				provider: model.provider,
 				api: output.api,
 				model: model.id,
@@ -151,97 +157,183 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				url,
 				body: params,
 			};
+			rawRequestDump = activeRawRequestDump;
 			const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
 				"azure-responses",
 				url,
 				typeof params.model === "string" ? params.model : model.id,
 			);
 			const attemptedReasoningEffortFallbacks = new Set<string>();
-			let openaiStream: AsyncIterable<ResponseStreamEvent>;
-			while (true) {
-				let requestTimeout: NodeJS.Timeout | undefined;
-				if (requestTimeoutMs !== undefined) {
-					requestTimeout = setTimeout(
-						() => abortTracker.abortLocally(firstEventTimeoutAbortError),
-						requestTimeoutMs,
-					);
-				}
-				try {
-					const headersWithTimeout = { ...headers };
+			const openAzureResponsesStreamWithFallbacks = async (): Promise<AsyncIterable<ResponseStreamEvent>> => {
+				while (true) {
+					let requestTimeout: NodeJS.Timeout | undefined;
 					if (requestTimeoutMs !== undefined) {
-						headersWithTimeout["X-Stainless-Timeout"] = Math.floor(requestTimeoutMs / 1000).toString();
+						requestTimeout = setTimeout(
+							() => abortTracker.abortLocally(firstEventTimeoutAbortError),
+							requestTimeoutMs,
+						);
 					}
-					const handle = await postOpenAIStream<ResponseStreamEvent>({
-						url,
-						headers: headersWithTimeout,
-						body: params,
-						signal: requestSignal,
-						fetch: options?.fetch,
-						// Transient 408/429/5xx get Retry-After-aware transport retries;
-						// the first-event watchdog aborts `requestSignal`, so retries
-						// cannot extend the caller's deadline.
-						onSseEvent: rawSseObserver,
-					});
-					openaiStream = handle.events;
-					break;
-				} catch (error) {
-					const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
-					const reasoningEffortFallback: OpenAIReasoningEffortFallback | undefined = !requestSignal.aborted
-						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
-						: undefined;
-					if (reasoningEffortFallback === undefined) throw error;
-					const retryMarker = `${reasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
-					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
-					attemptedReasoningEffortFallbacks.add(retryMarker);
-					applyOpenAIReasoningEffortFallback(params, reasoningEffortFallback);
-					rawRequestDump.body = params;
-				} finally {
-					if (requestTimeout !== undefined) clearTimeout(requestTimeout);
+					try {
+						const headersWithTimeout = { ...headers };
+						if (requestTimeoutMs !== undefined) {
+							headersWithTimeout["X-Stainless-Timeout"] = Math.floor(requestTimeoutMs / 1000).toString();
+						}
+						const handle = await postOpenAIStream<ResponseStreamEvent>({
+							url,
+							headers: headersWithTimeout,
+							body: params,
+							signal: requestSignal,
+							fetch: options?.fetch,
+							// Transient 408/429/5xx get Retry-After-aware transport retries;
+							// the first-event watchdog aborts `requestSignal`, so retries
+							// cannot extend the caller's deadline.
+							onSseEvent: rawSseObserver,
+						});
+						return handle.events;
+					} catch (error) {
+						const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
+						const reasoningEffortFallback: OpenAIReasoningEffortFallback | undefined = !requestSignal.aborted
+							? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
+							: undefined;
+						if (reasoningEffortFallback === undefined) throw error;
+						const retryMarker = `${reasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
+						if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
+						attemptedReasoningEffortFallbacks.add(retryMarker);
+						applyOpenAIReasoningEffortFallback(params, reasoningEffortFallback);
+						activeRawRequestDump.body = params;
+					} finally {
+						if (requestTimeout !== undefined) clearTimeout(requestTimeout);
+					}
 				}
-			}
+			};
+			let openaiStream = await openAzureResponsesStreamWithFallbacks();
 			stream.push({ type: "start", partial: output });
 
-			const timedOpenaiStream = iterateWithIdleTimeout(openaiStream, {
-				idleTimeoutMs,
-				firstItemTimeoutMs: firstEventTimeoutMs,
-				firstItemErrorMessage: AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE,
-				errorMessage: "Azure OpenAI responses stream stalled while waiting for the next event",
-				onIdle: () => requestAbortController.abort(),
-				onFirstItemTimeout: () => abortTracker.abortLocally(firstEventTimeoutAbortError),
-				abortSignal: options?.signal,
-				isProgressItem: isOpenAIResponsesProgressEvent,
-			});
-			let sawTerminalResponseEvent = false;
-			await processResponsesStream(timedOpenaiStream, output, stream, model, {
-				onFirstToken: () => {
-					if (!firstTokenTime) firstTokenTime = performance.now();
-				},
-				onCompleted: () => {
-					sawTerminalResponseEvent = true;
-				},
-			});
-
-			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
-			if (firstEventTimeoutError) {
-				throw firstEventTimeoutError;
-			}
-
-			if (abortTracker.wasCallerAbort()) {
-				throw new AIError.AbortError();
-			}
-
-			if (!sawTerminalResponseEvent) {
-				throw new AIError.ProviderResponseError(
-					"Azure OpenAI responses stream closed before a terminal response event was received",
-					{ provider: model.provider, kind: "incomplete-stream" },
-				);
-			}
-
-			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new AIError.ProviderResponseError(output.errorMessage ?? "An unknown error occurred", {
-					provider: model.provider,
-					kind: "output",
+			let transientStreamRetryAttempt = 0;
+			while (true) {
+				let sawReplayUnsafeOutput = false;
+				let sawTerminalResponseEvent = false;
+				const attemptStream = new AssistantMessageEventStream();
+				let forwardAttemptLive = false;
+				const forwardAttemptEvents = () => {
+					for (const event of attemptStream.queue) stream.push(event);
+					attemptStream.queue.length = 0;
+				};
+				const timedOpenaiStream = iterateWithIdleTimeout(openaiStream, {
+					idleTimeoutMs,
+					firstItemTimeoutMs: firstEventTimeoutMs,
+					firstItemErrorMessage: AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE,
+					errorMessage: "Azure OpenAI responses stream stalled while waiting for the next event",
+					onIdle: () => requestAbortController.abort(),
+					onFirstItemTimeout: () => abortTracker.abortLocally(firstEventTimeoutAbortError),
+					abortSignal: options?.signal,
+					isProgressItem: isOpenAIResponsesProgressEvent,
 				});
+				const observedOpenaiStream = (async function* (): AsyncGenerator<ResponseStreamEvent> {
+					for await (const event of timedOpenaiStream) {
+						if (isOpenAIResponsesReplayUnsafeEvent(event)) {
+							sawReplayUnsafeOutput = true;
+							if (!forwardAttemptLive) {
+								forwardAttemptEvents();
+								forwardAttemptLive = true;
+							}
+						}
+						yield event;
+						if (forwardAttemptLive) forwardAttemptEvents();
+					}
+				})();
+
+				try {
+					await processResponsesStream(observedOpenaiStream, output, attemptStream, model, {
+						onFirstToken: () => {
+							if (!firstTokenTime) firstTokenTime = performance.now();
+						},
+						onCompleted: () => {
+							sawTerminalResponseEvent = true;
+						},
+					});
+
+					const localAbortReason = abortTracker.getLocalAbortReason();
+					if (localAbortReason) {
+						throw localAbortReason;
+					}
+
+					if (abortTracker.wasCallerAbort()) {
+						throw new AIError.AbortError();
+					}
+
+					if (!sawTerminalResponseEvent) {
+						throw new AIError.ProviderResponseError(
+							"Azure OpenAI responses stream closed before a terminal response event was received",
+							{ provider: model.provider, kind: "incomplete-stream" },
+						);
+					}
+
+					if (output.stopReason === "aborted" || output.stopReason === "error") {
+						throw new AIError.ProviderResponseError(output.errorMessage ?? "An unknown error occurred", {
+							provider: model.provider,
+							kind: "output",
+						});
+					}
+					forwardAttemptEvents();
+					break;
+				} catch (error) {
+					const streamFailure = abortTracker.getLocalAbortReason() ?? error;
+					const canRetry =
+						!sawReplayUnsafeOutput &&
+						!requestSignal.aborted &&
+						!abortTracker.wasCallerAbort() &&
+						transientStreamRetryAttempt < AZURE_OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES &&
+						isRetryableOpenAIResponsesStreamFailure(streamFailure);
+					if (!canRetry) {
+						forwardAttemptEvents();
+						throw streamFailure;
+					}
+
+					transientStreamRetryAttempt++;
+					logger.debug("Azure OpenAI responses stream ended before replay-unsafe output; retrying", {
+						provider: model.provider,
+						model: model.id,
+						attempt: transientStreamRetryAttempt,
+						error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+					});
+					const backoffDelayMs = calculateOpenAIResponsesTransientStreamRetryDelayMs(
+						transientStreamRetryAttempt - 1,
+					);
+					// Honor the server's retry hint (`retry-after-ms`/`retry-after`):
+					// retrying sooner than the server asked is a guaranteed failure
+					// that just burns the retry budget.
+					const headerDelayMs = getRetryAfterMsFromHeaders(getHeadersFromError(streamFailure));
+					// Bound the server-directed wait so a multi-hour `retry-after` cannot
+					// park the provider stream before higher-level recovery runs. A non-positive cap
+					// disables the bound; an over-cap hint surfaces the original error immediately.
+					const maxRetryDelayMs = options?.maxRetryDelayMs ?? 60_000;
+					if (headerDelayMs !== undefined && maxRetryDelayMs > 0 && headerDelayMs > maxRetryDelayMs) {
+						forwardAttemptEvents();
+						throw streamFailure;
+					}
+					const delayMs = headerDelayMs !== undefined ? Math.max(headerDelayMs, backoffDelayMs) : backoffDelayMs;
+					const retryOutput = createInitialResponsesAssistantMessage(model.api, model.provider, model.id);
+					output.content.length = 0;
+					output.responseId = undefined;
+					output.errorMessage = undefined;
+					output.errorStatus = undefined;
+					output.errorId = undefined;
+					output.stopDetails = undefined;
+					output.usage = retryOutput.usage;
+					output.stopReason = "stop";
+					output.duration = undefined;
+					output.ttft = undefined;
+					firstTokenTime = undefined;
+
+					if (options?.providerRetryWait) {
+						await options.providerRetryWait(delayMs, options.signal);
+					} else {
+						await scheduler.wait(delayMs, { signal: options?.signal });
+					}
+					if (abortTracker.wasCallerAbort()) throw new AIError.AbortError();
+					openaiStream = await openAzureResponsesStreamWithFallbacks();
+				}
 			}
 
 			output.duration = performance.now() - startTime;

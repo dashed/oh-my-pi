@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add an `openRouterRouting` stream option forwarding OpenRouter provider-routing preferences (`ignore`/`only`/`order`/`sort`) into the request body on both OpenAI transports.
+
+### Fixed
+
+- Retry truncated OpenAI responses streams transparently: pure text deltas no longer mark an attempt replay-unsafe, so a mid-prose truncation now retries in-provider (up to 3 attempts, jittered backoff, Retry-After aware) instead of surfacing "OpenAI responses stream closed before a terminal response event was received". The same retry loop is ported to the Azure responses provider.
+
 ## [17.2.9] - 2026-08-05
 
 ### Fixed

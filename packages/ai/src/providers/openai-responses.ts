@@ -1,5 +1,6 @@
 import { scheduler } from "node:timers/promises";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
+import type { OpenRouterRouting } from "@oh-my-pi/pi-catalog/types";
 import { $flag, logger, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
@@ -35,6 +36,7 @@ import {
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
+import { getHeadersFromError, getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import {
 	adaptSchemaForStrict,
 	findStrictToolSchemaViolation,
@@ -76,6 +78,7 @@ import {
 	applyWireModelIdTransform,
 	buildResponsesDeltaInput,
 	buildResponsesInput,
+	calculateOpenAIResponsesTransientStreamRetryDelayMs,
 	clearOpenAIStrictToolsState,
 	createInitialResponsesAssistantMessage,
 	createOpenAIStrictToolsState,
@@ -86,7 +89,9 @@ import {
 	getOpenRouterResponsesSessionId,
 	isCompiledGrammarTooLargeStrictError,
 	isOpenAIResponsesProgressEvent,
+	isOpenAIResponsesReplayUnsafeEvent,
 	isOpenRouterAnthropicModel,
+	isRetryableOpenAIResponsesStreamFailure,
 	isStrictToolsDisabledForScope,
 	type OpenAIPromptCacheOptions,
 	type OpenAIStrictToolsScope,
@@ -107,6 +112,13 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 	textVerbosity?: "low" | "medium" | "high";
 	toolChoice?: ToolChoice;
 	openrouterVariant?: string;
+	/**
+	 * Per-request OpenRouter provider routing preferences (`provider` request
+	 * field): `only`/`order`/`ignore` slug lists and the `sort` preference.
+	 * Merged with the model's compat routing at the wire; compat (explicit
+	 * `@slug` pins) wins per field. Ignored by non-OpenRouter hosts.
+	 */
+	openRouterRouting?: OpenRouterRouting;
 	maxTokensExplicit?: boolean;
 	disableReasoning?: boolean;
 	/**
@@ -162,33 +174,7 @@ const OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI responses stream timed out while waiting for the first event";
 /** Consecutive stale-previous-response failures before chaining is disabled for the session. */
 const OPENAI_RESPONSES_CHAIN_STALE_FAILURE_LIMIT = 3;
-const OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES = 1;
-const OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS = 500;
-
-function isOpenAIResponsesReplayUnsafeEvent(event: ResponseStreamEvent): boolean {
-	switch (event.type) {
-		case "response.output_text.delta":
-		case "response.refusal.delta":
-		case "response.reasoning_summary_text.delta":
-		case "response.reasoning_text.delta":
-		case "response.function_call_arguments.delta":
-		case "response.custom_tool_call_input.delta":
-			return typeof event.delta === "string" && event.delta.length > 0;
-		case "response.reasoning_summary_part.done":
-			return true;
-		case "response.output_item.done":
-			return true;
-		default:
-			return false;
-	}
-}
-
-function isRetryableOpenAIResponsesStreamFailure(error: unknown): boolean {
-	return (
-		AIError.isTransientStreamParseError(error) ||
-		(error instanceof AIError.ProviderResponseError && error.kind === "incomplete-stream")
-	);
-}
+const OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES = 2;
 
 interface OpenAIResponsesProviderSessionState
 	extends ProviderSessionState,
@@ -790,6 +776,22 @@ const streamOpenAIResponsesOnce = (
 						attempt: transientStreamRetryAttempt,
 						error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 					});
+					const backoffDelayMs = calculateOpenAIResponsesTransientStreamRetryDelayMs(
+						transientStreamRetryAttempt - 1,
+					);
+					// Honor the server's retry hint (`retry-after-ms`/`retry-after`):
+					// retrying sooner than the server asked is a guaranteed failure
+					// that just burns the retry budget.
+					const headerDelayMs = getRetryAfterMsFromHeaders(getHeadersFromError(streamFailure));
+					// Bound the server-directed wait so a multi-hour `retry-after` cannot
+					// park the provider stream before higher-level recovery runs. A non-positive cap
+					// disables the bound; an over-cap hint surfaces the original error immediately.
+					const maxRetryDelayMs = options?.maxRetryDelayMs ?? 60_000;
+					if (headerDelayMs !== undefined && maxRetryDelayMs > 0 && headerDelayMs > maxRetryDelayMs) {
+						forwardAttemptEvents();
+						throw streamFailure;
+					}
+					const delayMs = headerDelayMs !== undefined ? Math.max(headerDelayMs, backoffDelayMs) : backoffDelayMs;
 					const retryOutput = createInitialResponsesAssistantMessage(model.api, model.provider, model.id);
 					output.content.length = 0;
 					output.responseId = undefined;
@@ -808,9 +810,9 @@ const streamOpenAIResponsesOnce = (
 					nativeOutputItems.length = 0;
 
 					if (options?.providerRetryWait) {
-						await options.providerRetryWait(OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS, options.signal);
+						await options.providerRetryWait(delayMs, options.signal);
 					} else {
-						await scheduler.wait(OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_DELAY_MS, { signal: options?.signal });
+						await scheduler.wait(delayMs, { signal: options?.signal });
 					}
 					if (abortTracker.wasCallerAbort()) throw new AIError.AbortError();
 					openaiStream = await openResponsesStreamWithFallbacks();
@@ -1256,7 +1258,7 @@ export function buildParams(
 	if (model.compat.isVercelGatewayHost) {
 		applyVercelResponsesCacheControls(params, model.compat, cacheRetention);
 	} else {
-		applyOpenAIGatewayRouting(params, model.compat);
+		applyOpenAIGatewayRouting(params, model.compat, true, options?.openRouterRouting);
 	}
 
 	applyOpenAIExtraBody(params, options?.extraBody);

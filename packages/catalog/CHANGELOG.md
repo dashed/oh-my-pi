@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Widen `OpenRouterRouting` with `ignore`, `only`, `order`, and `sort` fields.
+
 ## [17.2.9] - 2026-08-05
 
 ### Fixed

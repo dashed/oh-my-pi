@@ -538,6 +538,10 @@ export interface OpenRouterRouting {
 	only?: string[];
 	/** List of provider slugs to try in order (e.g., ["anthropic", "openai"]). */
 	order?: string[];
+	/** List of provider slugs to skip for this request (e.g., ["deepinfra"]). */
+	ignore?: string[];
+	/** Upstream sort preference; omitted keeps OpenRouter's default balancing. */
+	sort?: "price" | "throughput" | "latency";
 }
 
 /**

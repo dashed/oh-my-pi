@@ -633,17 +633,42 @@ export interface OpenAIGatewayRoutingCompat {
 }
 
 /**
+ * Merge caller/settings routing preferences with the model's compat routing
+ * (e.g. an explicit `@slug` selector pin). Compat wins per field — an explicit
+ * per-model pin is more specific than session-wide settings — while fields the
+ * compat leaves unset (typically `ignore`/`sort`) fall through from the
+ * override. Empty arrays and undefined fields never override a set value.
+ */
+export function mergeOpenRouterRouting(
+	override: OpenRouterRouting | undefined,
+	compatRouting: OpenRouterRouting | undefined,
+): OpenRouterRouting | undefined {
+	if (!override) return compatRouting;
+	if (!compatRouting) return override;
+	const merged: OpenRouterRouting = { ...override };
+	if (compatRouting.only?.length) merged.only = compatRouting.only;
+	if (compatRouting.order?.length) merged.order = compatRouting.order;
+	if (compatRouting.ignore?.length) merged.ignore = compatRouting.ignore;
+	if (compatRouting.sort) merged.sort = compatRouting.sort;
+	return merged;
+}
+
+/**
  * Apply gateway routing preferences to the request body. OpenRouter routes via
  * the top-level `provider` field; the Vercel AI Gateway routes Chat
- * Completions through `providerOptions.gateway`.
+ * Completions through `providerOptions.gateway`. `routingOverride` carries
+ * per-request settings (see `SimpleStreamOptions.openRouterRouting`) and is
+ * merged with the model compat routing via {@link mergeOpenRouterRouting}.
  */
 export function applyOpenAIGatewayRouting(
 	params: OpenAIGatewayRoutingParams,
 	compat: OpenAIGatewayRoutingCompat,
 	cacheEnabled = true,
+	routingOverride?: OpenRouterRouting,
 ): void {
-	if (compat.isOpenRouterHost && compat.openRouterRouting) {
-		params.provider = compat.openRouterRouting;
+	if (compat.isOpenRouterHost) {
+		const routing = mergeOpenRouterRouting(routingOverride, compat.openRouterRouting);
+		if (routing) params.provider = routing;
 	}
 	if (compat.isVercelGatewayHost && compat.vercelGatewayRouting) {
 		const routing = compat.vercelGatewayRouting;
@@ -1258,6 +1283,53 @@ export function isOpenAIResponsesProgressEvent(event: unknown): boolean {
 	if (!event || typeof event !== "object") return false;
 	const type = (event as { type?: unknown }).type;
 	return typeof type === "string" && OPENAI_RESPONSES_PROGRESS_EVENT_TYPES.has(type);
+}
+
+/**
+ * Events whose replay could duplicate user-visible or side-effecting output.
+ * Text and reasoning deltas are intentionally safe: the transient-stream retry
+ * loop buffers an attempt's events and only forwards them once a replay-unsafe
+ * event arrives, so a text-only attempt never reaches the consumer and can be
+ * discarded. Tool-call argument deltas, refusal text, and completed items or
+ * summary parts commit visible or side-effecting state and must block a retry.
+ */
+export function isOpenAIResponsesReplayUnsafeEvent(event: ResponseStreamEvent): boolean {
+	switch (event.type) {
+		case "response.refusal.delta":
+		case "response.function_call_arguments.delta":
+		case "response.custom_tool_call_input.delta":
+			return typeof event.delta === "string" && event.delta.length > 0;
+		case "response.reasoning_summary_part.done":
+			return true;
+		case "response.output_item.done":
+			return true;
+		default:
+			return false;
+	}
+}
+
+/** Transient mid-stream failures worth a fresh request: truncated bodies and premature EOF. */
+export function isRetryableOpenAIResponsesStreamFailure(error: unknown): boolean {
+	return (
+		AIError.isTransientStreamParseError(error) ||
+		(error instanceof AIError.ProviderResponseError && error.kind === "incomplete-stream")
+	);
+}
+
+const OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_INITIAL_DELAY_S = 1;
+const OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_MAX_DELAY_S = 4;
+
+/**
+ * Backoff for a discarded transient-stream attempt: 1s·2^attempt capped at 4s
+ * with 25% downward jitter (same shape as the Anthropic client retry delay).
+ */
+export function calculateOpenAIResponsesTransientStreamRetryDelayMs(attempt: number): number {
+	const sleepSeconds = Math.min(
+		OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_INITIAL_DELAY_S * 2 ** attempt,
+		OPENAI_RESPONSES_TRANSIENT_STREAM_RETRY_MAX_DELAY_S,
+	);
+	const jitter = 1 - Math.random() * 0.25;
+	return sleepSeconds * jitter * 1000;
 }
 
 export function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {

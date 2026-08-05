@@ -35,7 +35,7 @@ import type {
 } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { isOpenAIModelId } from "@oh-my-pi/pi-catalog/identity/family";
-import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
+import type { Api, FetchImpl, KnownApi, Model, OpenRouterRouting, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
 import type { ZodType, z } from "zod/v4";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
@@ -631,6 +631,15 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * or the catalog entry already names the variant).
 	 */
 	openrouterVariant?: string;
+	/**
+	 * Per-request OpenRouter provider routing preferences, serialized into the
+	 * request body's `provider` object (`only`/`order`/`ignore` slug lists and
+	 * the `sort` preference). Typically populated from the
+	 * `providers.openrouter.*` session settings by the settings-aware stream
+	 * wrapper. Merged with the model's compat routing at the wire — explicit
+	 * `@slug` selector pins win per field. Ignored by non-OpenRouter hosts.
+	 */
+	openRouterRouting?: OpenRouterRouting;
 	/**
 	 * Caller-owned Google context-cache resource name. Forwarded only to the
 	 * direct Gemini GenerateContent and Vertex GenerateContent APIs; all other
