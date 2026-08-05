@@ -62,6 +62,7 @@ import { formatDuration } from "./helpers/format";
 import { createMarketplaceManager } from "./helpers/marketplace-manager";
 import { handleMcpAcp } from "./helpers/mcp";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
+import { runProviderCommand } from "./helpers/provider";
 import { describeRedeemOutcome, type ResetUsageAccount, toResetUsageAccounts } from "./helpers/reset-usage";
 import { handleSecurityCommand } from "./helpers/security";
 import { matchSessionPinAccounts, toSessionPinAccounts } from "./helpers/session-pin";
@@ -742,6 +743,32 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			runtime.ctx.showStatus("Usage: /vision [on|off|auto|status]");
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "provider",
+		description: "Show OpenRouter upstream provider stats and manage routing bans",
+		acpDescription: "OpenRouter upstream provider stats and bans",
+		acpInputHint: "[ignore|unignore <slug>]",
+		subcommands: [
+			{ name: "ignore", description: "Ban an OpenRouter upstream slug (persists providers.openrouter.ignore)", usage: "<slug>" },
+			{ name: "unignore", description: "Remove an OpenRouter upstream ban", usage: "<slug>" },
+		],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			await runtime.output(
+				await runProviderCommand(command.args, { settings: runtime.settings, session: runtime.session }),
+			);
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			runtime.ctx.showStatus(
+				await runProviderCommand(command.args, {
+					settings: runtime.ctx.session.settings,
+					session: runtime.ctx.session,
+				}),
+			);
 			runtime.ctx.editor.setText("");
 		},
 	},

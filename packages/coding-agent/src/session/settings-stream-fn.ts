@@ -11,7 +11,7 @@
  * and OpenRouter response-cache hits across advisor calls.
  */
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
-import { type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
+import { type OpenRouterRouting, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { isAnthropicFableOrMythosModel } from "@oh-my-pi/pi-catalog/identity";
 import { type Settings, validateProviderMaxInFlightRequests } from "../config/settings";
 
@@ -32,6 +32,19 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 		const openrouterRoutingPreset = settings.get("providers.openrouterVariant");
 		const openrouterVariant =
 			openrouterRoutingPreset && openrouterRoutingPreset !== "default" ? openrouterRoutingPreset : undefined;
+		// Upstream provider routing (request body `provider` object), read per
+		// request so /provider ignore and config edits apply without a restart.
+		const openrouterIgnore = settings.get("providers.openrouter.ignore");
+		const openrouterOnly = settings.get("providers.openrouter.only");
+		const openrouterOrder = settings.get("providers.openrouter.order");
+		const openrouterSort = settings.get("providers.openrouter.sort");
+		const settingsOpenRouterRouting: OpenRouterRouting = {};
+		if (openrouterIgnore.length > 0) settingsOpenRouterRouting.ignore = openrouterIgnore;
+		if (openrouterOnly.length > 0) settingsOpenRouterRouting.only = openrouterOnly;
+		if (openrouterOrder.length > 0) settingsOpenRouterRouting.order = openrouterOrder;
+		if (openrouterSort) settingsOpenRouterRouting.sort = openrouterSort;
+		const openRouterRouting =
+			Object.keys(settingsOpenRouterRouting).length > 0 ? settingsOpenRouterRouting : undefined;
 		const antigravityEndpointMode = settings.get("providers.antigravityEndpoint");
 		const textVerbosity =
 			model.api === "openai-codex-responses"
@@ -58,6 +71,7 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 		const merged: SimpleStreamOptions = {
 			...streamOptions,
 			openrouterVariant: streamOptions?.openrouterVariant ?? openrouterVariant,
+			openRouterRouting: streamOptions?.openRouterRouting ?? openRouterRouting,
 			antigravityEndpointMode: streamOptions?.antigravityEndpointMode ?? antigravityEndpointMode,
 			textVerbosity: streamOptions?.textVerbosity ?? textVerbosity,
 			streamFirstEventTimeoutMs: streamOptions?.streamFirstEventTimeoutMs ?? streamFirstEventTimeoutMs,

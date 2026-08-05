@@ -5308,6 +5308,35 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+
+	// OpenRouter upstream provider routing (request body `provider` object).
+	// Managed via /provider ignore|unignore or hand-edited config.yml; applied
+	// per request, so edits take effect without a restart. Explicit `@slug`
+	// model-selector pins win over `only`/`order` here.
+	"providers.openrouter.ignore": { type: "array", default: EMPTY_STRING_ARRAY },
+	"providers.openrouter.only": { type: "array", default: EMPTY_STRING_ARRAY },
+	"providers.openrouter.order": { type: "array", default: EMPTY_STRING_ARRAY },
+	"providers.openrouter.sort": {
+		type: "enum",
+		values: ["", "price", "throughput", "latency"] as const,
+		default: "",
+		ui: {
+			tab: "providers",
+			group: "Protocol",
+			label: "OpenRouter Provider Sort",
+			description: "Sort preference OpenRouter applies when choosing among upstream providers",
+			options: [
+				{ value: "", label: "Default", description: "OpenRouter's default load balancing" },
+				{ value: "price", label: "Price", description: "Cheapest upstream first" },
+				{ value: "throughput", label: "Throughput", description: "Highest tokens/second first" },
+				{ value: "latency", label: "Latency", description: "Lowest time-to-first-token first" },
+			],
+		},
+	},
+	// Slow-upstream detection thresholds for the rolling per-provider stats
+	// (last 20 turns) and the post-turn dim notice. Config-file only.
+	"providers.openrouter.slowTokensPerSecond": { type: "number", default: 15 },
+	"providers.openrouter.slowTtftMs": { type: "number", default: 5000 },
 	"providers.fetch": {
 		type: "enum",
 		values: ["auto", "native", "trafilatura", "lynx", "parallel", "jina"] as const,

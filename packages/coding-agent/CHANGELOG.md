@@ -4,6 +4,7 @@
 
 ### Added
 
+- Add OpenRouter routing control: per-provider rolling stats (median tok/s, TTFT p50) persisted to `~/.omp/agent/routing-stats.json` and surfaced by `/provider`, enriched with OpenRouter-reported latency/throughput; slow providers trigger a one-line notice with a ready ban command; `providers.openrouter.{ignore,only,order,sort}` settings apply per request without restart, and `/provider ignore|unignore <slug>` persists bans to `config.yml`.
 - Surface keyboard shortcuts in the UI: contextual footer hints across the agent hub, selectors, dialogs, and editors now render labels from the live keybinding registry, so custom rebinds are reflected; open the full shortcuts panel with `f1` or `ctrl+/` (also `/hotkeys`); welcome splash now hints at it.
 - Show a live elapsed-time timer for running subagents in the Agent Hub rows and inline task transcript rows.
 - Replace the plain working loader with a live indicator above the editor: spinner, current activity (the tool in flight, or a rotating verb), elapsed time, streamed output tokens, throughput (tok/s), time-to-first-token, and the serving provider for OpenRouter-routed models. Subagents HUD rows now show the same live per-subagent activity labels.

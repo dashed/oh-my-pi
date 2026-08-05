@@ -24,6 +24,16 @@ import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
+import { fetchOpenRouterGenerationProvider } from "../../session/openrouter-endpoint-stats";
+import {
+	buildRoutingTurnSample,
+	getRoutingStatsTracker,
+	isOpenRouterBackfillCandidate,
+	type RoutingStatsTracker,
+	routingSampleFromMessage,
+	SlowProviderNotifier,
+	type SlowProviderThresholds,
+} from "../../session/routing-stats";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { formatToolActivity, previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
@@ -131,6 +141,8 @@ export class EventController {
 	// #handleMessageEnd / #handleAgentStart).
 	#pinnedErrorComponent: AssistantMessageComponent | undefined = undefined;
 	#retrySupersededAssistantComponents = new Map<string, AssistantMessageComponent>();
+	// Slow-upstream notice dedup: one dim line per OpenRouter slug per session.
+	#slowProviderNotifier = new SlowProviderNotifier();
 	#retrySupersededAssistantQueue: AssistantMessageComponent[] = [];
 	// Set when `auto_retry_start` fires and cleared by `auto_retry_end` (both
 	// outcomes) — true for exactly the window a retry is outstanding. Gates
@@ -1210,6 +1222,7 @@ export class EventController {
 				}
 				this.ctx.lastAssistantUsage = usage;
 			}
+			this.#recordUpstreamRoutingSample(event.message);
 			this.ctx.streamingComponent.markTranscriptBlockFinalized();
 			let lastPostToolAssistantComponent: AssistantMessageComponent | undefined;
 			for (const [toolCallId, segment] of displayTimeline.afterToolCalls) {
@@ -1260,6 +1273,64 @@ export class EventController {
 			this.ctx.ui.requestRender();
 		}
 		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * Feed the rolling per-upstream routing stats from a finished assistant
+	 * message and surface the (deduped) slow-provider notice. Turns without
+	 * upstream attribution are a no-op, except OpenRouter turns carrying a
+	 * `gen-…` response id, which get a best-effort attribution backfill via the
+	 * generation endpoint. Local rolling stats stay the detection source; the
+	 * API call never blocks the turn.
+	 */
+	#recordUpstreamRoutingSample(message: AssistantMessage): void {
+		const tracker = getRoutingStatsTracker();
+		const recorded = routingSampleFromMessage(message);
+		if (recorded) {
+			tracker.record(recorded.slug, recorded.sample);
+			this.#notifyIfSlow(tracker, recorded.slug);
+			return;
+		}
+		if (isOpenRouterBackfillCandidate(message)) {
+			void this.#backfillUpstreamAttribution(message);
+		}
+	}
+
+	#slowProviderThresholds(): SlowProviderThresholds {
+		return {
+			minTokensPerSecond: settings.get("providers.openrouter.slowTokensPerSecond"),
+			maxTtftMs: settings.get("providers.openrouter.slowTtftMs"),
+		};
+	}
+
+	#notifyIfSlow(tracker: RoutingStatsTracker, slug: string): void {
+		const notice = this.#slowProviderNotifier.maybeNotify(tracker, slug, this.#slowProviderThresholds());
+		if (notice) this.ctx.showStatus(notice, { dim: true });
+	}
+
+	async #backfillUpstreamAttribution(message: AssistantMessage): Promise<void> {
+		const generationId = message.responseId;
+		if (!generationId) return;
+		try {
+			const apiKey = await this.ctx.session.modelRegistry.authStorage.getApiKey(
+				"openrouter",
+				this.ctx.session.sessionId,
+			);
+			if (!apiKey) return;
+			const slug = await fetchOpenRouterGenerationProvider(generationId, { apiKey });
+			if (!slug) return;
+			const sample = buildRoutingTurnSample({
+				outputTokens: message.usage.output,
+				durationMs: message.duration,
+				ttftMs: message.ttft,
+			});
+			if (!sample) return;
+			const tracker = getRoutingStatsTracker();
+			tracker.record(slug, sample);
+			this.#notifyIfSlow(tracker, slug);
+		} catch (error) {
+			logger.debug("OpenRouter upstream attribution backfill failed", { error: String(error) });
+		}
 	}
 
 	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {

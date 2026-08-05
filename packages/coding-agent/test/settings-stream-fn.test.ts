@@ -230,4 +230,75 @@ describe("createSettingsAwareStreamFn", () => {
 			expect(calls[0]?.options?.fallbacks).toEqual([{ model: "claude-sonnet-5" }]);
 		});
 	});
+
+	describe("providers.openrouter.* routing", () => {
+		it("builds openRouterRouting from the ignore/only/order/sort settings", () => {
+			const settings = Settings.isolated({
+				"providers.openrouter.ignore": ["deepinfra"],
+				"providers.openrouter.only": ["anthropic"],
+				"providers.openrouter.order": ["anthropic", "openai"],
+				"providers.openrouter.sort": "throughput",
+			});
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(settings, base);
+
+			wrapped(stubModel, stubContext, { apiKey: "k" });
+
+			expect(calls[0]?.options?.openRouterRouting).toEqual({
+				ignore: ["deepinfra"],
+				only: ["anthropic"],
+				order: ["anthropic", "openai"],
+				sort: "throughput",
+			});
+		});
+
+		it("omits openRouterRouting entirely when all routing settings are defaults", () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(settings, base);
+
+			wrapped(stubModel, stubContext, { apiKey: "k" });
+
+			expect(calls[0]?.options?.openRouterRouting).toBeUndefined();
+		});
+
+		it("omits empty arrays and the empty sort so they never reach the wire", () => {
+			const settings = Settings.isolated({ "providers.openrouter.ignore": ["deepinfra"] });
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(settings, base);
+
+			wrapped(stubModel, stubContext, { apiKey: "k" });
+
+			expect(calls[0]?.options?.openRouterRouting).toEqual({ ignore: ["deepinfra"] });
+		});
+
+		it("lets caller-supplied openRouterRouting override the session settings", () => {
+			const settings = Settings.isolated({ "providers.openrouter.ignore": ["deepinfra"] });
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(settings, base);
+
+			wrapped(stubModel, stubContext, { apiKey: "k", openRouterRouting: { only: ["together"] } });
+
+			expect(calls[0]?.options?.openRouterRouting).toEqual({ only: ["together"] });
+		});
+
+		it("recomputes per request: a mid-session /provider ignore lands on the very next call", () => {
+			const settings = Settings.isolated({});
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(settings, base);
+
+			wrapped(stubModel, stubContext, { apiKey: "k" });
+			expect(calls[0]?.options?.openRouterRouting).toBeUndefined();
+
+			// `/provider ignore deepinfra` → settings.set + flush; no restart.
+			settings.set("providers.openrouter.ignore", ["deepinfra"]);
+			wrapped(stubModel, stubContext, { apiKey: "k" });
+			expect(calls[1]?.options?.openRouterRouting).toEqual({ ignore: ["deepinfra"] });
+
+			// `/provider unignore deepinfra` → next call is clean again.
+			settings.set("providers.openrouter.ignore", []);
+			wrapped(stubModel, stubContext, { apiKey: "k" });
+			expect(calls[2]?.options?.openRouterRouting).toBeUndefined();
+		});
+	});
 });
