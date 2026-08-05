@@ -233,6 +233,16 @@ For the bash tool specifically:
 - Never use `tsc`/`npx tsc` — always `bun check`.
 - Merge commits (maintainer merges of PRs) follow: `Merge PR #<number>: <conventional PR subject> (@<author>)` — e.g. `Merge PR #6386: feat(catalog): add native Meta Model API provider (@eggpeat)`.
 
+## Fork Workflow (jj)
+
+This repo is a colocated jj + git repository. The divergent fork branch is `alberto/my-fork` (remote `fork` = dashed/oh-my-pi; `origin` = upstream can1357/oh-my-pi, never pushed to).
+
+- **Use `jj`, not `git`, for local VCS operations** (`jj status`/`jj diff`/`jj describe`/`jj new`/`jj squash`). The working copy is always a commit (`@`) and auto-snapshots — nothing needs staging.
+- **Concurrent agents work in jj workspaces**, never the main checkout: `jj workspace add ~/aaa/github/omp-ws-<name>` rooted at a fresh change on `alberto/my-fork`. Work only inside your assigned workspace path.
+- **Durability**: run `jj describe -m "<what you're doing>"` early and update it at milestones; your workspace is snapshotted on every jj command, and `jj op log` can recover anything.
+- **Agents never push.** Report your change ID when done; the lead integrates (rebase onto `alberto/my-fork`, run gates, `jj git push --bookmark alberto/my-fork --remote fork`).
+- Before any `git switch`/`git checkout` in this repo, run `jj new` first to park `@` (git sees `@` as uncommitted).
+
 ## Testing Guidance
 
 Test the contract the system exposes — not the easiest internal detail to assert.
