@@ -7,4 +7,4 @@
  * keeps the version display identical to upstream. Do not edit by hand —
  * `bun run stamp:fork-commit:reset` regenerates this placeholder.
  */
-export const FORK_COMMIT: string = "";
+export const FORK_COMMIT: string = "762ced0";
