@@ -104,6 +104,7 @@ import {
 	resolveOpenAICompletionsOutputClamp,
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
+	sanitizeUpstreamProvider,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
 import { transformMessages } from "./transform-messages";
@@ -1069,9 +1070,11 @@ const streamOpenAICompletionsOnce = (
 				// field present on every chunk. Capture the first non-empty value so
 				// callers can attribute routing without re-parsing the raw stream.
 				if (!output.upstreamProvider) {
-					const upstreamProvider = (chunk as ProviderAttributedChatCompletionChunk).provider;
-					output.upstreamProvider =
-						typeof upstreamProvider === "string" && upstreamProvider.length > 0 ? upstreamProvider : undefined;
+					// Network-controlled string rendered verbatim in the TUI and
+					// persisted as a stats key: keep only a safe charset.
+					output.upstreamProvider = sanitizeUpstreamProvider(
+						(chunk as ProviderAttributedChatCompletionChunk).provider,
+					);
 				}
 
 				if (chunk.usage) {

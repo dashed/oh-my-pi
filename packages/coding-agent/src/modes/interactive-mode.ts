@@ -49,6 +49,7 @@ import {
 	logger,
 	postmortem,
 	prompt,
+	sanitizeText,
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
@@ -381,8 +382,9 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 				const currentTool = session.progress?.currentTool?.trim();
 				if (currentTool) {
 					// Shared "Reading src/foo.ts"-style activity label (same formatter
-					// the working indicator uses); unknown tools keep the raw name.
-					const activity = formatToolActivity(currentTool, session.progress?.currentToolArgs) ?? currentTool;
+					// the working indicator uses); unknown tools keep the raw name,
+					// control-stripped — tool names can come from MCP servers.
+					const activity = formatToolActivity(currentTool, session.progress?.currentToolArgs) ?? sanitizeText(currentTool);
 					line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(activity), TRUNCATE_LENGTHS.SHORT))}`;
 				}
 				return line;

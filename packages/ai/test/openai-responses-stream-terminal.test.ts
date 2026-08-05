@@ -120,6 +120,58 @@ describe("processResponsesStream: terminal events", () => {
 		expect(output.content).toEqual([expect.objectContaining({ type: "text", text: "Hello, trunc" })]);
 	});
 
+	// Contract: aggregators (OpenRouter, …) attach a top-level `provider` to the
+	// terminal response object — the Responses twin of the completions per-chunk
+	// field. It is network-controlled and rendered verbatim downstream, so it is
+	// charset-sanitized at adoption.
+	test("adopts the aggregator-reported provider from the terminal response, charset-sanitized", async () => {
+		const output = makeOutput();
+		const emitted: EmittedEvent[] = [];
+		const stream = { push: (e: unknown) => emitted.push(e as EmittedEvent), end: () => {} } as never;
+
+		await processResponsesStream(
+			makeStream([
+				{
+					type: "response.completed",
+					sequence_number: 1,
+					response: {
+						id: "resp_hostile",
+						status: "completed",
+						provider: '\x1b[2J\x1b]52;c;PGFjZT4=\x07"amazon-bedrock"',
+					},
+				},
+			]),
+			output,
+			stream,
+			makeModel(),
+		);
+
+		expect(output.upstreamProvider).toBe("2J52cPGFjZT4amazon-bedrock");
+		expect(output.upstreamProvider).not.toMatch(/[\x00-\x1F\x7F-\x9F"]/);
+	});
+
+	test("leaves upstreamProvider undefined when the terminal response omits it", async () => {
+		const output = makeOutput();
+		const emitted: EmittedEvent[] = [];
+		const stream = { push: (e: unknown) => emitted.push(e as EmittedEvent), end: () => {} } as never;
+
+		await processResponsesStream(
+			makeStream([
+				{
+					type: "response.completed",
+					sequence_number: 1,
+					response: { id: "resp_plain", status: "completed" },
+				},
+			]),
+			output,
+			stream,
+			makeModel(),
+		);
+
+		expect(output.responseId).toBe("resp_plain");
+		expect(output.upstreamProvider).toBeUndefined();
+	});
+
 	test("promotes max-output incomplete function calls with strict-complete arguments", async () => {
 		const output = makeOutput();
 		const stream = { push: () => {}, end: () => {} } as never;

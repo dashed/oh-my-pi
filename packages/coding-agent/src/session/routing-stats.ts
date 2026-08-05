@@ -107,7 +107,11 @@ function parsePersistedSamples(raw: unknown): RoutingTurnSample[] {
 
 async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
 	const content = `${JSON.stringify(data, null, 2)}\n`;
-	const tmpPath = `${filePath}.tmp`;
+	// Unique per writer: concurrently running omp processes share the stats
+	// file, and a fixed tmp name lets interleaved writes tear the document
+	// (mirrors the board/settings tmp-name convention). A crash can litter
+	// the tmp file; hydration tolerates a missing/corrupt stats file.
+	const tmpPath = `${filePath}.${process.pid}.${Bun.randomUUIDv7()}.tmp`;
 	await Bun.write(tmpPath, content);
 	try {
 		await fs.rename(tmpPath, filePath);

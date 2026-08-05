@@ -6,6 +6,7 @@
  * notifier fires the slow notice at most once per slug.
  */
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import {
 	buildRoutingTurnSample,
 	isOpenRouterBackfillCandidate,
@@ -144,6 +145,24 @@ describe("RoutingStatsTracker persistence", () => {
 		expect(second.getSummary("anthropic")?.medianTokensPerSecond).toBe(5);
 		expect(second.getSummary("google-vertex")?.turns).toBe(2);
 		expect(second.isSlow("anthropic", THRESHOLDS)).toBe(true);
+	});
+
+	it("persists via a unique tmp name and leaves no tmp litter behind", async () => {
+		tempDir = TempDir.createSync("@pi-routing-stats-");
+		const filePath = tempDir.join("routing-stats.json");
+		const tracker = new RoutingStatsTracker({ persistPath: filePath, saveThrottleMs: 0 });
+		await tracker.ready;
+		recordTurns(tracker, "anthropic", 1, slowSample());
+		await tracker.flush();
+
+		const entries = await fs.readdir(tempDir.path());
+		expect(entries.filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+		expect(entries).toContain("routing-stats.json");
+		const persisted = JSON.parse(await Bun.file(filePath).text()) as {
+			providers: Record<string, { samples: unknown[] }>;
+		};
+		expect(persisted.providers["anthropic"]?.samples).toHaveLength(1);
+		tracker.dispose();
 	});
 
 	it("throttles writes and flush() forces them", async () => {

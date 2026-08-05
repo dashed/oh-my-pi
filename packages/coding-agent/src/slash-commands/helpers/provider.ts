@@ -15,11 +15,21 @@ import {
 	OpenRouterEndpointStatsCache,
 	openRouterEndpointStatsCache,
 } from "../../session/openrouter-endpoint-stats";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { getRoutingStatsTracker, type RoutingStatsTracker } from "../../session/routing-stats";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
 
 const USAGE = "Usage: /provider [ignore <slug>|unignore <slug>]";
 const SLUG_COLUMN_WIDTH = 28;
+
+/**
+ * Slugs are persisted to config.yml and forwarded to OpenRouter in every
+ * request body, and rendered back in the table/slow-notice. Restrict them to
+ * the endpoint-tag charset (regional tags carry a `/`, e.g.
+ * `google-vertex/europe`) so control bytes, quotes, and YAML indicators can
+ * never reach the config file or the terminal.
+ */
+const SLUG_RE = /^[a-z0-9][a-z0-9._/-]*$/i;
 
 export interface ProviderCommandDeps {
 	settings: Settings;
@@ -33,7 +43,7 @@ export interface ProviderCommandDeps {
 }
 
 function sanitizeSlug(slug: string): string {
-	return truncateToWidth(replaceTabs(slug), SLUG_COLUMN_WIDTH);
+	return truncateToWidth(replaceTabs(sanitizeText(slug)), SLUG_COLUMN_WIDTH);
 }
 
 function formatTokensPerSecond(value: number | undefined): string {
@@ -128,7 +138,7 @@ export async function runProviderCommand(args: string, deps: ProviderCommandDeps
 	const slug = rest.join(" ").trim();
 	if ((verb === "ignore" || verb === "unignore") && !slug) return USAGE;
 	if (verb !== "ignore" && verb !== "unignore") return USAGE;
-	if (/\s/.test(slug)) return USAGE;
+	if (!SLUG_RE.test(slug)) return USAGE;
 
 	const settings = deps.settings;
 	const current = settings.get("providers.openrouter.ignore");

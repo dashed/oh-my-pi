@@ -117,6 +117,24 @@ describe("/provider ignore|unignore", () => {
 		await executeAcpBuiltinSlashCommand("/provider ignore", runtime);
 		expect(output).toHaveBeenCalledWith("Usage: /provider [ignore <slug>|unignore <slug>]");
 	});
+
+	it("rejects slugs carrying control bytes, quotes, or YAML indicators", async () => {
+		const settings = Settings.isolated();
+		const { output, runtime } = acpRuntime(settings);
+		for (const slug of ["\x1b[2Jevil", 'evil"slug', "evil'slug", "evil:slug", "evil#slug", "evil slug"]) {
+			output.mockClear();
+			await executeAcpBuiltinSlashCommand(`/provider ignore ${slug}`, runtime);
+			expect(output).toHaveBeenCalledWith("Usage: /provider [ignore <slug>|unignore <slug>]");
+		}
+		expect(settings.get("providers.openrouter.ignore")).toEqual([]);
+	});
+
+	it("accepts regional endpoint tags carrying a slash", async () => {
+		const settings = Settings.isolated();
+		const { runtime } = acpRuntime(settings);
+		await executeAcpBuiltinSlashCommand("/provider ignore google-vertex/europe", runtime);
+		expect(settings.get("providers.openrouter.ignore")).toEqual(["google-vertex/europe"]);
+	});
 });
 
 describe("/provider table", () => {

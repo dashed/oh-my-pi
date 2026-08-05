@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir, TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../src/config/settings";
@@ -200,6 +201,30 @@ describe("board flow through the tool", () => {
 		const result = await execute(tool, { op: "complete", taskId: created.details!.task!.id });
 		expect(result.isError).toBe(true);
 		expect(result.details?.error).toBe("invalid_state");
+	});
+
+	it("list output contains zero control bytes from a hand-written task file", async () => {
+		// Anyone with local file access can write the board dir directly,
+		// bypassing create's input cleaning; the read path must sanitize.
+		const dir = temp.join("tasks");
+		await fs.mkdir(dir, { recursive: true });
+		await Bun.write(
+			path.join(dir, "0f3a9c1e2b4d5678.json"),
+			JSON.stringify({
+				id: "0f3a9c1e2b4d5678",
+				title: "planted \x1b]52;c;PGFjZT4=\x07 payload",
+				status: "pending",
+				blockedBy: [],
+				createdBy: "test",
+				createdAt: Date.now(),
+			}),
+		);
+
+		const result = await execute(makeTool(), { op: "list" });
+		const text = textOf(result);
+		expect(text).toContain("planted");
+		expect(text).toContain("payload");
+		expect(text).not.toMatch(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/);
 	});
 });
 

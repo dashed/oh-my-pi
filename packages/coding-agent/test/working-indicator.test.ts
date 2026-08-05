@@ -70,6 +70,20 @@ describe("formatToolActivity", () => {
 	it("returns undefined for unknown tools so callers fall back to a gerund", () => {
 		expect(formatToolActivity("xdev", { path: "src/foo.ts" })).toBeUndefined();
 	});
+
+	it("strips ANSI/OSC control bytes from model-controlled tool args", () => {
+		const out = formatToolActivity("bash", { command: "ls \x1b]52;c;PGFjZT4=\x07 && cat \x1b[2J secrets" });
+		expect(out).toBe("Running ls && cat secrets");
+		expect(out).not.toMatch(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/);
+	});
+
+	it("strips control bytes from the pre-extracted string preview", () => {
+		expect(formatToolActivity("read", "src/\x1b[31mfoo.ts\x1b[0m")).toBe("Reading src/foo.ts");
+	});
+
+	it("leaves ordinary text untouched", () => {
+		expect(formatToolActivity("grep", { pattern: "foo.*bar" })).toBe("Searching foo.*bar");
+	});
 });
 
 describe("WorkingIndicator", () => {
@@ -494,6 +508,22 @@ describe("subagent HUD activity labels", () => {
 		);
 		expect(out).toContain("Worker: live work");
 		expect(out).toContain("· Reading src/foo.ts");
+	});
+
+	it("strips control bytes from an unknown tool's raw name", () => {
+		const raw = renderSubagentHudLines(
+			[
+				makeSession({
+					id: "Worker",
+					description: "live work",
+					progress: makeProgress({ id: "Worker", currentTool: "mcp_evil\x1b[2J_tool" }),
+				}),
+			],
+			120,
+		).join("\n");
+		// Theme SGR legitimately contains ESC; the injected CSI must not survive.
+		expect(raw).not.toContain("\x1b[2J");
+		expect(strip(raw)).toContain("mcp_evil_tool");
 	});
 });
 

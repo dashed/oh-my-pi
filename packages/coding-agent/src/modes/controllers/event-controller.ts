@@ -24,7 +24,10 @@ import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
-import { fetchOpenRouterGenerationProvider } from "../../session/openrouter-endpoint-stats";
+import {
+	fetchOpenRouterGenerationProvider,
+	resolveOpenRouterGenerationTag,
+} from "../../session/openrouter-endpoint-stats";
 import {
 	buildRoutingTurnSample,
 	getRoutingStatsTracker,
@@ -1317,7 +1320,14 @@ export class EventController {
 				this.ctx.session.sessionId,
 			);
 			if (!apiKey) return;
-			const slug = await fetchOpenRouterGenerationProvider(generationId, { apiKey });
+			const providerName = await fetchOpenRouterGenerationProvider(generationId, { apiKey });
+			if (!providerName) return;
+			// The generation endpoint reports a display name ("Amazon Bedrock");
+			// stats and bans key on endpoint tags ("amazon-bedrock"), so map before
+			// recording. Unmappable names are skipped (logged at debug inside).
+			const modelId = this.ctx.session.model?.id;
+			if (!modelId) return;
+			const slug = await resolveOpenRouterGenerationTag(modelId, providerName);
 			if (!slug) return;
 			const sample = buildRoutingTurnSample({
 				outputTokens: message.usage.output,

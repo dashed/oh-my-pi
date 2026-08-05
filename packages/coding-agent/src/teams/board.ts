@@ -18,7 +18,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getConfigRootDir, isEexist, isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, isEexist, isRecord, logger, sanitizeText, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AgentRegistry } from "../registry/agent-registry";
 
 // =============================================================================
@@ -155,18 +155,23 @@ function lockDelayMs(attempt: number): number {
 
 /**
  * Run `fn` holding the per-task O_EXCL lock for `taskFilePath`.
- * The lock file is removed on release; contention retries with short
- * backoff; a stale lock (mtime > {@link LOCK_STALE_MS}) is broken once and
- * acquisition retried.
+ * The lock file carries a unique ownership token (pid + timestamp + random
+ * id); it is removed on release ONLY when the on-disk content still matches
+ * our token, so a stalled holder whose lock was broken and re-acquired by a
+ * peer can never unlink the peer's live lock. Contention retries with short
+ * backoff; a stale lock (mtime > {@link LOCK_STALE_MS}) is broken once (after
+ * re-verifying it is still the same file we observed, so a racing breaker
+ * cannot trick us into deleting its fresh lock) and acquisition retried.
  */
 export async function withTaskLock<T>(taskFilePath: string, fn: () => Promise<T>): Promise<T> {
 	const lockPath = `${taskFilePath}.lock`;
+	const token = `${process.pid} ${Date.now()} ${Bun.randomUUIDv7()}`;
 	let brokeStale = false;
 	let handle: fs.FileHandle | null = null;
 	for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
 		try {
 			handle = await fs.open(lockPath, "wx");
-			await handle.writeFile(`${process.pid} ${Date.now()}`);
+			await handle.writeFile(token);
 			break;
 		} catch (error) {
 			if (!isEexist(error)) throw error;
@@ -174,7 +179,13 @@ export async function withTaskLock<T>(taskFilePath: string, fn: () => Promise<T>
 				const stat = await fs.stat(lockPath).catch(() => null);
 				if (stat && Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
 					logger.warn("team board: breaking stale task lock", { lockPath });
-					await fs.rm(lockPath, { force: true }).catch(() => {});
+					// TOCTOU guard: a contender may have broken the stale lock and
+					// re-created it as its own fresh lock between our stat and rm.
+					// Delete only when the file identity is unchanged.
+					const verify = await fs.stat(lockPath).catch(() => null);
+					if (verify && verify.ino === stat.ino && verify.mtimeMs === stat.mtimeMs) {
+						await fs.rm(lockPath, { force: true }).catch(() => {});
+					}
 					brokeStale = true;
 					continue;
 				}
@@ -190,7 +201,8 @@ export async function withTaskLock<T>(taskFilePath: string, fn: () => Promise<T>
 		return await fn();
 	} finally {
 		await handle.close().catch(() => {});
-		await fs.rm(lockPath, { force: true }).catch(() => {});
+		const stillOurs = await fs.readFile(lockPath, "utf8").then(content => content === token, () => false);
+		if (stillOurs) await fs.rm(lockPath, { force: true }).catch(() => {});
 	}
 }
 
@@ -198,15 +210,36 @@ export async function withTaskLock<T>(taskFilePath: string, fn: () => Promise<T>
 // Atomic persistence
 // =============================================================================
 
+/** Board state is private work metadata (mirrors security/store.ts). */
+const BOARD_DIR_MODE = 0o700;
+const TASK_FILE_MODE = 0o600;
+
+async function ensureBoardDir(dir: string): Promise<void> {
+	await fs.mkdir(dir, { recursive: true, mode: BOARD_DIR_MODE });
+	// Defensive: recursive mkdir applies the mode only to leaf dirs it creates.
+	if (process.platform !== "win32") await fs.chmod(dir, BOARD_DIR_MODE).catch(() => {});
+}
+
 async function writeTaskAtomic(filePath: string, task: TeamTask): Promise<void> {
 	const tempPath = `${filePath}.${process.pid}.${Snowflake.next()}.tmp`;
 	try {
-		await Bun.write(tempPath, `${JSON.stringify(task, null, 2)}\n`);
+		await fs.writeFile(tempPath, `${JSON.stringify(task, null, 2)}\n`, { encoding: "utf-8", mode: TASK_FILE_MODE });
+		if (process.platform !== "win32") await fs.chmod(tempPath, TASK_FILE_MODE).catch(() => {});
 		await fs.rename(tempPath, filePath);
 	} catch (error) {
 		await fs.rm(tempPath, { force: true }).catch(() => {});
 		throw error;
 	}
+}
+
+/**
+ * On-disk text is untrusted: any same-user process can write the board dir,
+ * bypassing the team tool's input cleaning, and the raw strings flow into
+ * `team list` results and hub broadcasts. Cap sizes mirror the tool's
+ * create/complete caps (title 200, free text 4000).
+ */
+function cleanStoredText(value: string, max: number): string {
+	return sanitizeText(value).trim().slice(0, max);
 }
 
 /** Read one task file; missing or corrupt files yield `null` (corrupt logs a warning). */
@@ -223,7 +256,14 @@ async function readTaskFile(filePath: string): Promise<TeamTask | null> {
 			logger.warn("team board: skipping invalid task file", { filePath });
 			return null;
 		}
-		return { ...value, blockedBy: value.blockedBy ?? [] };
+		return {
+			...value,
+			title: cleanStoredText(value.title, 200),
+			description: value.description === undefined ? undefined : cleanStoredText(value.description, 4000),
+			claimedBy: value.claimedBy === undefined ? undefined : cleanStoredText(value.claimedBy, 200),
+			result: value.result === undefined ? undefined : cleanStoredText(value.result, 4000),
+			blockedBy: value.blockedBy ?? [],
+		};
 	} catch {
 		logger.warn("team board: skipping corrupt task file", { filePath });
 		return null;
@@ -282,7 +322,7 @@ export class TeamBoard {
 		if (new Set(blockedBy).size !== blockedBy.length) {
 			return failure("invalid_input", "blockedBy contains duplicate task ids.");
 		}
-		await fs.mkdir(this.dir, { recursive: true });
+		await ensureBoardDir(this.dir);
 		for (const depId of blockedBy) {
 			if (!(await readTaskFile(this.#taskPath(depId)))) {
 				return failure("invalid_input", `blockedBy task "${depId}" does not exist on the board.`);
@@ -312,7 +352,7 @@ export class TeamBoard {
 	 */
 	async claim(taskId: string, actor: string): Promise<TeamBoardOutcome> {
 		if (!isValidTaskId(taskId)) return failure("invalid_input", `Invalid task id "${taskId}".`);
-		await fs.mkdir(this.dir, { recursive: true });
+		await ensureBoardDir(this.dir);
 		const filePath = this.#taskPath(taskId);
 		try {
 			return await withTaskLock(filePath, async () => {
@@ -357,7 +397,7 @@ export class TeamBoard {
 	 */
 	async complete(taskId: string, result?: string): Promise<TeamBoardOutcome> {
 		if (!isValidTaskId(taskId)) return failure("invalid_input", `Invalid task id "${taskId}".`);
-		await fs.mkdir(this.dir, { recursive: true });
+		await ensureBoardDir(this.dir);
 		const filePath = this.#taskPath(taskId);
 		let outcome: TeamBoardOutcome;
 		try {
@@ -407,7 +447,7 @@ export class TeamBoard {
 	/** Return a claimed task to pending so another agent can claim it. */
 	async release(taskId: string): Promise<TeamBoardOutcome> {
 		if (!isValidTaskId(taskId)) return failure("invalid_input", `Invalid task id "${taskId}".`);
-		await fs.mkdir(this.dir, { recursive: true });
+		await ensureBoardDir(this.dir);
 		const filePath = this.#taskPath(taskId);
 		try {
 			return await withTaskLock(filePath, async () => {

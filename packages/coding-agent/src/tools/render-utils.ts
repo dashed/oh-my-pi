@@ -11,7 +11,7 @@ import type { ToolCallContext } from "@oh-my-pi/pi-agent-core";
 import type { Ellipsis } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { getKeybindings, replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
-import { pluralize } from "@oh-my-pi/pi-utils";
+import { pluralize, sanitizeText } from "@oh-my-pi/pi-utils";
 import { formatKeyHints, type KeyId } from "../config/keybindings";
 import { isSettingsInitialized, settings } from "../config/settings";
 import { getDefault } from "../config/settings-schema";
@@ -171,8 +171,10 @@ const TOOL_ACTIVITY_DETAIL_KEYS = ["command", "file_path", "path", "pattern", "q
  * `undefined` when the tool has no known verb — callers fall back to a generic
  * gerund. `args` accepts either the raw tool-call arguments (at
  * `tool_execution_start`) or the pre-extracted string preview carried by
- * subagent progress snapshots. Detail text is tab-expanded, whitespace-collapsed,
- * and width-truncated so the label is always a single safe line.
+ * subagent progress snapshots. Detail text is control-stripped (the args are
+ * model-controlled and the label renders verbatim in the terminal),
+ * tab-expanded, whitespace-collapsed, and width-truncated so the label is
+ * always a single safe line.
  */
 export function formatToolActivity(
 	toolName: string,
@@ -195,7 +197,7 @@ export function formatToolActivity(
 		}
 	}
 	if (!detail) return verb;
-	const collapsed = replaceTabs(detail).replace(/\s+/g, " ").trim();
+	const collapsed = replaceTabs(sanitizeText(detail)).replace(/\s+/g, " ").trim();
 	if (!collapsed) return verb;
 	return `${verb} ${truncateToWidth(collapsed, maxDetailWidth)}`;
 }

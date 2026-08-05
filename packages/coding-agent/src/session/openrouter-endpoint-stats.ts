@@ -131,6 +131,57 @@ export class OpenRouterEndpointStatsCache {
 export const openRouterEndpointStatsCache = new OpenRouterEndpointStatsCache();
 
 /**
+ * Map a generation-endpoint `provider_name` (a display name like "Amazon
+ * Bedrock") to the endpoint `tag` slug the routing prefs/stats keyspace uses.
+ * Display names and tags match case-insensitively; the tag itself is also
+ * accepted so a tag-shaped attribution round-trips.
+ */
+export function mapProviderNameToEndpointTag(
+	perf: readonly OpenRouterEndpointPerf[],
+	providerName: string,
+): string | undefined {
+	const needle = providerName.trim().toLowerCase();
+	if (needle.length === 0) return undefined;
+	for (const entry of perf) {
+		if (entry.providerName.toLowerCase() === needle || entry.tag.toLowerCase() === needle) return entry.tag;
+	}
+	return undefined;
+}
+
+/**
+ * Resolve a generation backfill's display name to the endpoint tag slug for
+ * `modelId`, via the (cached) endpoints list. Returns `undefined` — and notes
+ * why at debug level — when the name maps to no endpoint: recording the
+ * display name itself would poison the tag keyspace with a ban that can never
+ * apply (`/provider ignore` matches tags, and spaced names are not even
+ * typable).
+ */
+export async function resolveOpenRouterGenerationTag(
+	modelId: string,
+	providerName: string,
+	options: OpenRouterFetchOptions & { cache?: OpenRouterEndpointStatsCache } = {},
+): Promise<string | undefined> {
+	const cache = options.cache ?? openRouterEndpointStatsCache;
+	let perf: OpenRouterEndpointPerf[];
+	try {
+		perf = await cache.get(modelId, options);
+	} catch (error) {
+		logger.debug("OpenRouter generation backfill: endpoint lookup failed, skipping attribution", {
+			providerName,
+			error: String(error),
+		});
+		return undefined;
+	}
+	const tag = mapProviderNameToEndpointTag(perf, providerName);
+	if (!tag) {
+		logger.debug("OpenRouter generation backfill: provider_name maps to no endpoint tag, skipping attribution", {
+			providerName,
+		});
+	}
+	return tag;
+}
+
+/**
  * Authoritative upstream attribution for one generation, via the
  * account-scoped generation endpoint. Returns the provider display name
  * (e.g. "DigitalOcean") or `undefined` on any failure — backfill is

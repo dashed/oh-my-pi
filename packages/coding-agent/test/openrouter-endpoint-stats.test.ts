@@ -11,7 +11,9 @@ import { describe, expect, it, vi } from "bun:test";
 import {
 	fetchOpenRouterEndpointPerf,
 	fetchOpenRouterGenerationProvider,
+	mapProviderNameToEndpointTag,
 	OpenRouterEndpointStatsCache,
+	resolveOpenRouterGenerationTag,
 	stripOpenRouterVariantSuffix,
 } from "@oh-my-pi/pi-coding-agent/session/openrouter-endpoint-stats";
 
@@ -196,5 +198,58 @@ describe("fetchOpenRouterGenerationProvider", () => {
 			fetchImpl: fetchMock as unknown as typeof fetch,
 		});
 		expect(provider).toBeUndefined();
+	});
+});
+
+describe("mapProviderNameToEndpointTag", () => {
+	it("maps a display name to the endpoint tag, case-insensitively", async () => {
+		const fetchMock = vi.fn(async () => jsonResponse(endpointsFixture()));
+		const perf = await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+		});
+		expect(mapProviderNameToEndpointTag(perf, "Amazon Bedrock")).toBe("amazon-bedrock");
+		expect(mapProviderNameToEndpointTag(perf, "amazon bedrock")).toBe("amazon-bedrock");
+		// The two Google endpoints share one display name; the first match wins.
+		expect(mapProviderNameToEndpointTag(perf, "Google")).toBe("google-vertex/global");
+		// A tag-shaped attribution round-trips.
+		expect(mapProviderNameToEndpointTag(perf, "google-vertex/europe")).toBe("google-vertex/europe");
+	});
+
+	it("returns undefined for names no endpoint carries", async () => {
+		const fetchMock = vi.fn(async () => jsonResponse(endpointsFixture()));
+		const perf = await fetchOpenRouterEndpointPerf("anthropic/claude-sonnet-4", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+		});
+		expect(mapProviderNameToEndpointTag(perf, "Mystery Provider")).toBeUndefined();
+		expect(mapProviderNameToEndpointTag(perf, "")).toBeUndefined();
+	});
+});
+
+describe("resolveOpenRouterGenerationTag", () => {
+	it("resolves a generation display name through the cached endpoints list", async () => {
+		const fetchMock = vi.fn(async () => jsonResponse(endpointsFixture()));
+		const tag = await resolveOpenRouterGenerationTag("anthropic/claude-sonnet-4", "Amazon Bedrock", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+			cache: new OpenRouterEndpointStatsCache(),
+		});
+		expect(tag).toBe("amazon-bedrock");
+	});
+
+	it("returns undefined when the display name maps to no endpoint tag", async () => {
+		const fetchMock = vi.fn(async () => jsonResponse(endpointsFixture()));
+		const tag = await resolveOpenRouterGenerationTag("anthropic/claude-sonnet-4", "Mystery Provider", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+			cache: new OpenRouterEndpointStatsCache(),
+		});
+		expect(tag).toBeUndefined();
+	});
+
+	it("returns undefined when the endpoint lookup fails", async () => {
+		const fetchMock = vi.fn(async () => jsonResponse({ error: "down" }, 503));
+		const tag = await resolveOpenRouterGenerationTag("anthropic/claude-sonnet-4", "Amazon Bedrock", {
+			fetchImpl: fetchMock as unknown as typeof fetch,
+			cache: new OpenRouterEndpointStatsCache(),
+		});
+		expect(tag).toBeUndefined();
 	});
 });

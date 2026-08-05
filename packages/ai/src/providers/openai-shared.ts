@@ -404,6 +404,24 @@ export function applyOpenRouterReportedCost(model: Pick<Model, "provider">, usag
 	usage.cost.total = reportedCost;
 }
 
+/**
+ * Anything outside the slug-ish charset is dropped from the network-controlled
+ * upstream attribution before it lands on the assistant message: the value is
+ * rendered verbatim in the working indicator and `/provider` table and
+ * persisted as a routing-stats.json key, so control bytes, quotes, and other
+ * terminal/YAML-significant characters must never survive.
+ */
+const UPSTREAM_PROVIDER_UNSAFE_RE = /[^A-Za-z0-9 ._-]+/g;
+const UPSTREAM_PROVIDER_MAX_LENGTH = 64;
+
+/** Sanitize the aggregator-reported `provider` field; `undefined` when nothing safe remains. */
+export function sanitizeUpstreamProvider(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length === 0) return undefined;
+	const cleaned = value.replace(UPSTREAM_PROVIDER_UNSAFE_RE, "").trim();
+	if (cleaned.length === 0) return undefined;
+	return cleaned.slice(0, UPSTREAM_PROVIDER_MAX_LENGTH);
+}
+
 export interface OpenAIUsageAccountingInput {
 	promptTokens: number;
 	outputTokens: number;
@@ -3075,6 +3093,14 @@ export async function processResponsesStream<TApi extends Api>(
 			finalizePendingResponsesToolCalls(output);
 			if (response?.id) {
 				output.responseId = response.id;
+			}
+			// Aggregators (OpenRouter, …) attach a top-level `provider` to the
+			// terminal response object, twin of the per-chunk field the
+			// completions stream reads; network-controlled, so charset-filtered.
+			if (!output.upstreamProvider) {
+				output.upstreamProvider = sanitizeUpstreamProvider(
+					(response as { provider?: unknown } | undefined)?.provider,
+				);
 			}
 			populateResponsesUsageFromResponse(output, response?.usage);
 			calculateCost(model, output.usage);

@@ -12,7 +12,7 @@
  */
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { padding, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatAge, formatDuration } from "@oh-my-pi/pi-utils";
+import { formatAge, formatDuration, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { IrcBus } from "../../irc/bus";
 import { type AgentRef, type AgentStatus, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { parseThinkingLevel } from "../../thinking";
@@ -114,7 +114,8 @@ export function formatAgentRow(
 	const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
 	const fields: string[] = [`${cursor} ${statusGlyph(ref.status)} ${theme.bold(replaceTabs(ref.id))}`];
 	if (ref.displayName && ref.displayName !== ref.id) {
-		fields.push(theme.fg("dim", replaceTabs(ref.displayName)));
+		// displayName is model-chosen at spawn; strip control bytes before render.
+		fields.push(theme.fg("dim", replaceTabs(sanitizeText(ref.displayName))));
 	}
 	if (ref.parentId && ref.parentId !== MAIN_AGENT_ID) {
 		fields.push(theme.fg("dim", `↳ ${replaceTabs(ref.parentId)}`));
@@ -142,7 +143,9 @@ export function formatAgentRow(
 		// cost, formatted like the inline task rows' stats segment.
 		const progress = observed?.progress;
 		if (progress?.currentTool) {
-			meta.push(theme.fg("dim", truncateToWidth(replaceTabs(progress.currentTool), AGENT_ROW_CURRENT_TOOL_MAX)));
+			meta.push(
+				theme.fg("dim", truncateToWidth(replaceTabs(sanitizeText(progress.currentTool)), AGENT_ROW_CURRENT_TOOL_MAX)),
+			);
 		}
 		if (progress && progress.cost > 0) {
 			meta.push(theme.fg("statusLineCost", `$${progress.cost.toFixed(2)}`));

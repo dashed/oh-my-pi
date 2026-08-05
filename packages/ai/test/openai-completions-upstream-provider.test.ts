@@ -70,4 +70,52 @@ describe("openai-completions upstream provider capture", () => {
 
 		expect(result.upstreamProvider).toBeUndefined();
 	});
+
+	// Contract: the provider string is network-controlled and is rendered
+	// verbatim in the working indicator / `/provider` table and persisted as a
+	// routing-stats.json key, so anything outside the slug charset (control
+	// bytes, quotes, …) is stripped at adoption.
+	it("strips control bytes and quotes from a hostile provider string", async () => {
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				createSseResponse([
+					chunk({
+						provider: '\x1b[2J\x1b]52;c;PGFjZT4=\x07"amazon-bedrock"',
+						choices: [{ index: 0, delta: { content: "Hi" } }],
+					}),
+					chunk({
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+						usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+					}),
+				]),
+			);
+
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.upstreamProvider).toBe("2J52cPGFjZT4amazon-bedrock");
+		expect(result.upstreamProvider).not.toMatch(/[\x00-\x1F\x7F-\x9F"]/);
+	});
+
+	it("drops the attribution when nothing safe remains", async () => {
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				createSseResponse([
+					chunk({ provider: "\x1b\x07\"'", choices: [{ index: 0, delta: { content: "Hi" } }] }),
+					chunk({
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+						usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+					}),
+				]),
+			);
+
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.upstreamProvider).toBeUndefined();
+	});
 });
