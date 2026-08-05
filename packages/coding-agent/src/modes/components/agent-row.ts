@@ -7,8 +7,10 @@
  * One agent entry, 1-2 lines:
  * `❯ ⟳ Name  type  ↳ parent  ⧉ 2 ········ model ◒ level · age` — identity
  * left, metadata right-aligned (inlined when the terminal is too narrow) —
- * plus an indented dim task line when the agent's work is known. Running
- * agents show a ticking elapsed-since-start (`⏱ 3m12s`) instead of age.
+ * plus an indented dim detail line when the agent's work is known. Running
+ * agents show a ticking elapsed-since-start (`⏱ 3m12s`) instead of age, lead
+ * the detail line with their live intent, and surface heartbeat silence as a
+ * dim `quiet Ns` meta segment.
  */
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { padding, visibleWidth } from "@oh-my-pi/pi-tui";
@@ -22,6 +24,14 @@ import { theme } from "../theme/theme";
 
 /** Max width for the current-tool name on a running row's meta segment. */
 const AGENT_ROW_CURRENT_TOOL_MAX = 24;
+
+/**
+ * Heartbeat-silence threshold for a running row's `quiet Ns` freshness cue.
+ * Live agents bump `lastUpdate`/`lastActivity` on every coalesced progress
+ * flush (~150ms cadence while anything streams), so once nothing has been
+ * observed for this long the silence itself is the signal worth showing.
+ */
+const AGENT_ROW_QUIET_THRESHOLD_MS = 5_000;
 
 /** Compute the max content width for the current terminal, accounting for chrome. */
 function contentWidth(): number {
@@ -97,11 +107,13 @@ function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): str
 
 /**
  * One agent row, 1-2 lines — identity left, metadata right-aligned (inlined
- * when the terminal is too narrow), plus an indented muted task line when the
- * agent's work is known. `observed` is the caller-resolved observer snapshot
- * for `ref.id` (hub: `#observableFor`, panel: `observers.getSession`); `irc`
- * supplies the unread-count badge. Running agents show a ticking
- * elapsed-since-start (`⏱ 3m12s`) instead of age.
+ * when the terminal is too narrow), plus an indented muted detail line when
+ * the agent's work is known. `observed` is the caller-resolved observer
+ * snapshot for `ref.id` (hub: `#observableFor`, panel: `observers.getSession`);
+ * `irc` supplies the unread-count badge. Running agents show a ticking
+ * elapsed-since-start (`⏱ 3m12s`) instead of age, lead the detail line with
+ * their live intent (sanitized + truncated), and gain a dim `quiet Ns`
+ * freshness cue once no heartbeat has been observed for a few seconds.
  */
 export function formatAgentRow(
 	ref: AgentRef,
@@ -153,6 +165,14 @@ export function formatAgentRow(
 		if (progress && progress.cost > 0) {
 			meta.push(theme.fg("statusLineCost", `$${progress.cost.toFixed(2)}`));
 		}
+		// Liveness: age of the freshest observed beat (observer progress flush or
+		// registry heartbeat). While anything streams this is pinned near zero;
+		// past the threshold, surface the silence so a quietly-stuck agent is
+		// glanceable instead of indistinguishable from a healthy one.
+		const quietMs = Date.now() - Math.max(observed?.lastUpdate ?? 0, ref.lastActivity);
+		if (quietMs >= AGENT_ROW_QUIET_THRESHOLD_MS) {
+			meta.push(theme.fg("dim", `quiet ${formatDuration(quietMs)}`));
+		}
 	} else {
 		meta.push(theme.fg("dim", formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))));
 	}
@@ -166,11 +186,18 @@ export function formatAgentRow(
 			: truncateToWidth(`${left}  ${right}`.replace(/[\r\n]+/g, " "), max);
 	const entry = [line];
 
-	const task = observed?.description ?? observed?.progress?.task ?? ref.activity;
+	// A running row leads its detail line with the agent's live intent — the
+	// model-written objective of the current step — falling back to the static
+	// description/task before one has streamed. Model-derived text gets the
+	// full sanitize (control-byte/ANSI strip + tab replace) before truncation.
+	// Idle/parked rows keep the static task line unchanged.
+	const intent = ref.status === "running" ? observed?.progress?.lastIntent : undefined;
+	const task = intent ?? observed?.description ?? observed?.progress?.task ?? ref.activity;
 	if (task) {
 		// Model/collab-chosen text: strip control bytes (sanitizeText) before
 		// the single-line/truncate pass, mirroring displayName/currentTool.
-		entry.push(`     ${theme.fg("muted", sanitizeLine(sanitizeText(task), Math.max(10, max - 5)))}`);
+		const detail = intent ? sanitizeText(intent) : sanitizeText(task);
+		entry.push(`     ${theme.fg("muted", sanitizeLine(detail, Math.max(10, max - 5)))}`);
 	}
 	return entry;
 }
