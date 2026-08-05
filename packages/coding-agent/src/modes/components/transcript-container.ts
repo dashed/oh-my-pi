@@ -182,6 +182,16 @@ export class TranscriptContainer
 	// consumes the report and re-bases the baseline). Out-of-band renders
 	// between engine frames lower it; they can never inflate it.
 	#stableRowsFloor = 0;
+	// Monotonic epoch bumped on every clear(). Transcript backfill chunks
+	// snapshot it at schedule time and abort when it moves: a clear means the
+	// container was rebuilt by a full re-render, which supersedes the backfill.
+	#mutationEpoch = 0;
+	// While a transcript backfill front-inserts older history above the
+	// already-rendered tail, no transcript row may commit to native scrollback:
+	// the tape is append-only and inserted rows shift every offset below them.
+	// The pin forces the live-region seam to row 0 so the whole transcript
+	// stays repaintable until the backfill completes.
+	#backfillPinned = false;
 	override invalidate(): void {
 		// Theme/global invalidation: retire every diff snapshot so stale styling
 		// is not diffed against the recolored render.
@@ -190,9 +200,47 @@ export class TranscriptContainer
 	}
 
 	override clear(): void {
+		this.#mutationEpoch++;
+		this.#backfillPinned = false;
 		this.#generation++;
 		super.clear();
 		this.#committedRows = 0;
+	}
+
+	/** Monotonic container-clear epoch; backfill drivers use it to detect a rebuild. */
+	getMutationEpoch(): number {
+		return this.#mutationEpoch;
+	}
+
+	/** Width of the most recent full render, or -1 when the container never rendered. */
+	getLastRenderWidth(): number {
+		return this.#renderWidth;
+	}
+
+	/**
+	 * Pin the native-scrollback live-region seam to row 0 while a transcript
+	 * backfill is inserting older blocks above the rendered tail. With the seam
+	 * at 0 the engine commits no transcript rows, keeping every row repaintable
+	 * so front-inserts stay expressible (see #backfillPinned). Cleared by
+	 * {@link clear} and by the backfill driver on completion.
+	 */
+	setBackfillPinned(pinned: boolean): void {
+		this.#backfillPinned = pinned;
+	}
+
+	/**
+	 * Insert a block at an arbitrary child index (transcript backfill
+	 * front-inserts older history above the already-rendered tail). Segment
+	 * bookkeeping is dropped: the next render re-derives every segment (child
+	 * renders are per-width cached, so this is an assembly walk, not a
+	 * re-layout). The live region MUST be pinned first
+	 * ({@link setBackfillPinned}) when inserting above rendered rows — the
+	 * engine cannot express interior inserts into committed native scrollback.
+	 */
+	override insertChildAt(index: number, component: Component): void {
+		super.insertChildAt(index, component);
+		this.#segments = EMPTY_SEGMENTS;
+		this.#stableRowsFloor = 0;
 	}
 
 	override setNativeScrollbackCommittedRows(rows: number): void {
@@ -511,6 +559,9 @@ export class TranscriptContainer
 		if (lines.length !== row) lines.length = row;
 		this.#segments = segments;
 		this.#stableRowsFloor = Math.min(stableFloorBefore, stableRows, row);
+		// Backfill pin wins over the computed seam: with older history about to
+		// be front-inserted, every transcript row must stay repaintable.
+		if (this.#backfillPinned) this.#nativeScrollbackLiveRegionStart = 0;
 		return lines;
 	}
 }

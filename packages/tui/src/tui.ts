@@ -516,6 +516,20 @@ export class Container implements Component, NativeScrollbackCommittedRows, Nati
 		this.#memoLines = undefined;
 	}
 
+	/**
+	 * Insert a child at an arbitrary index (clamped into range). Backfill-style
+	 * callers use this to prepend older content above an already-rendered tail;
+	 * the memoized concatenation is dropped exactly as for {@link addChild}.
+	 */
+	insertChildAt(index: number, component: Component): void {
+		const at = Math.max(0, Math.min(index, this.children.length));
+		this.children.splice(at, 0, component);
+		if (this.#ignoreTight) {
+			component.setIgnoreTight?.(true);
+		}
+		this.#memoLines = undefined;
+	}
+
 	removeChild(component: Component): void {
 		const index = this.children.indexOf(component);
 		if (index !== -1) {

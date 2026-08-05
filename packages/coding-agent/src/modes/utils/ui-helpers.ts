@@ -32,7 +32,7 @@ import {
 } from "../../modes/components/read-tool-group";
 import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { StrippedToolCallsPlaceholder } from "../../modes/components/stripped-tool-calls-placeholder";
-import { ToolExecutionComponent } from "../../modes/components/tool-execution";
+import { ToolExecutionComponent, type ToolExecutionHandle } from "../../modes/components/tool-execution";
 import { TranscriptBlock } from "../../modes/components/transcript-container";
 import { createUsageRowBlock } from "../../modes/components/usage-row";
 import { UserMessageComponent } from "../../modes/components/user-message";
@@ -68,6 +68,133 @@ interface RenderInitialMessagesOptions {
 	clearTerminalHistory?: boolean;
 }
 
+/**
+ * Sizing knobs for the windowed initial transcript render. Resuming a large
+ * session used to synchronously construct a component for every transcript
+ * message before the first paint (a minute-long frozen frame on multi-thousand
+ * message sessions). The initial render now covers only a tail window sized to
+ * roughly a viewport of markdown, and the older prefix backfills lazily in
+ * event-loop chunks afterwards.
+ */
+export interface TranscriptWindowConfig {
+	/** Below this many context messages the full render is cheap enough; no windowing. */
+	minTotalMessages: number;
+	/** Hard cap on messages rendered synchronously in the initial tail window. */
+	maxWindowMessages: number;
+	/** Soft floor: the window always covers at least this many tail messages. */
+	minWindowMessages: number;
+	/** Estimated content bytes the initial window may carry before expanding stops. */
+	windowByteBudget: number;
+	/** Event-loop budget per backfill chunk; the loop yields between chunks. */
+	chunkBudgetMs: number;
+}
+
+const DEFAULT_TRANSCRIPT_WINDOW_CONFIG: TranscriptWindowConfig = {
+	minTotalMessages: 120,
+	maxWindowMessages: 120,
+	minWindowMessages: 24,
+	// Calibrated against the real 7MB/2.4k-message resume fixture: ~35ms per
+	// content-KB of component construction puts the window render at ~1s.
+	windowByteBudget: 32 * 1024,
+	chunkBudgetMs: 24,
+};
+
+/**
+ * Output target for transcript reconstruction. The live tail renders straight
+ * into the chat container; a backfill renders the older prefix through a
+ * front-inserting sink so those blocks land above the already-rendered tail.
+ */
+interface TranscriptRenderSink {
+	addChild(component: Component): void;
+	removeChild(component: Component): void;
+	isBlockUncommitted(component: Component): boolean;
+	/** The most recently emitted block (the chat container's last child for the live tail). */
+	lastChild(): Component | undefined;
+}
+
+/** Execution parameters for one rendered range of the transcript message list. */
+interface TranscriptRangeRuntime {
+	/** First context message index to render (inclusive). */
+	start: number;
+	/** Last context message index to render (exclusive). */
+	end: number;
+	/** Tool-call component registry for this range; the live tail uses ctx.pendingTools. */
+	pendingTools: Map<string, ToolExecutionHandle>;
+	/** Cache-invalidation baseline carried into the range (the prefix's last billed usage). */
+	seedLastAssistantUsage: Usage | undefined;
+	/**
+	 * "tail": the range ends at the transcript tail — run the full end-of-render
+	 * resolution (streaming handoff included). "boundary": the range ends right
+	 * before a user prompt — resolve carried state exactly as a full replay does
+	 * when that prompt is processed (seal snapshots, never the streaming handoff).
+	 */
+	trailing: "tail" | "boundary";
+}
+
+/** Where the tail window starts and what state the window render must carry in. */
+interface TranscriptWindowPlan {
+	/** First windowed message index; messages before it backfill lazily. */
+	cut: number;
+	/** The prefix's last billed assistant usage — the window's cache-invalidation baseline. */
+	carryUsage: Usage | undefined;
+}
+
+/** In-flight prefix backfill: the generator, its front-insert sink, and resume bookkeeping. */
+interface TranscriptBackfillState {
+	/** Chat-container mutation epoch captured at schedule time; a bump means the container was rebuilt. */
+	epoch: number;
+	/** The prefix render, pumped message-at-a-time across event-loop turns. */
+	range: Generator<void, void, void>;
+	sink: TranscriptRenderSink;
+	/** Next child index for front-inserts; everything below it is already-backfilled prefix. */
+	insertIndex: number;
+	/** The prefix render's cache-invalidation baseline, parked between chunks. */
+	prefixUsage: Usage | undefined;
+	scheduled: boolean;
+}
+
+/**
+ * Index of the first tool result at/after `cut` whose call sits before `cut`
+ * (a pair split by the window boundary), or -1 when every pair is contained.
+ * Each replayed range pairs results against its own registry, so a straddling
+ * pair would orphan the result block.
+ */
+function firstStraddlingToolResult(messages: AgentMessage[], cut: number): number {
+	const prefixCallIds = new Set<string>();
+	for (let i = 0; i < cut; i++) {
+		const message = messages[i]!;
+		if (message.role !== "assistant") continue;
+		for (const content of message.content) {
+			if (content.type === "toolCall") prefixCallIds.add(content.id);
+		}
+	}
+	for (let i = cut; i < messages.length; i++) {
+		const message = messages[i]!;
+		if (message.role === "toolResult" && prefixCallIds.has(message.toolCallId)) return i;
+	}
+	return -1;
+}
+
+/**
+ * Rough render-cost proxy for one message: text/thinking bytes dominate
+ * markdown lex+highlight time, tool-call arguments carry write/edit payloads.
+ * Image data is materialized to links and never lexed, so it is not counted.
+ */
+function estimateMessageRenderBytes(message: AgentMessage): number {
+	if (!("content" in message)) return 256;
+	const content = message.content;
+	if (typeof content === "string") return content.length + 64;
+	if (!Array.isArray(content)) return 256;
+	let bytes = 64;
+	for (const block of content) {
+		if (typeof block !== "object" || block === null) continue;
+		if ("text" in block && typeof block.text === "string") bytes += block.text.length;
+		if ("thinking" in block && typeof block.thinking === "string") bytes += block.thinking.length;
+		if ("arguments" in block && block.arguments !== undefined) bytes += JSON.stringify(block.arguments).length;
+	}
+	return bytes;
+}
+
 type QueuedMessages = {
 	steering: string[];
 	followUp: string[];
@@ -93,8 +220,25 @@ function imageLinksForMessage(
 export class UiHelpers {
 	#lastWarningMessage: string | undefined = undefined;
 	#lastWarningCount = 0;
+	private ctx: InteractiveModeContext;
+	readonly #windowConfig: TranscriptWindowConfig;
+	/** Set only while a backfill chunk pumps synchronously; live renders always hit the default sink. */
+	#transcriptSink: TranscriptRenderSink | null = null;
+	#backfill: TranscriptBackfillState | null = null;
+	readonly #defaultTranscriptSink: TranscriptRenderSink = {
+		addChild: component => this.ctx.chatContainer.addChild(component),
+		removeChild: component => this.ctx.chatContainer.removeChild(component),
+		isBlockUncommitted: component => this.ctx.chatContainer.isBlockUncommitted(component),
+		lastChild: () => {
+			const children = this.ctx.chatContainer.children;
+			return children[children.length - 1];
+		},
+	};
 
-	constructor(private ctx: InteractiveModeContext) {}
+	constructor(ctx: InteractiveModeContext, transcriptWindow?: Partial<TranscriptWindowConfig>) {
+		this.ctx = ctx;
+		this.#windowConfig = { ...DEFAULT_TRANSCRIPT_WINDOW_CONFIG, ...transcriptWindow };
+	}
 
 	/** Extract text content from a user message */
 	getUserMessageText(message: Message): string {
@@ -136,6 +280,7 @@ export class UiHelpers {
 	}
 
 	addMessageToChat(message: AgentMessage, options?: AddMessageOptions): Component[] {
+		const sink = this.#transcriptSink ?? this.#defaultTranscriptSink;
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.ctx.ui, message.excludeFromContext);
@@ -145,7 +290,7 @@ export class UiHelpers {
 				component.setComplete(message.exitCode, message.cancelled, {
 					truncation: message.meta?.truncation,
 				});
-				this.ctx.chatContainer.addChild(component);
+				sink.addChild(component);
 				break;
 			}
 			case "pythonExecution": {
@@ -156,14 +301,14 @@ export class UiHelpers {
 				component.setComplete(message.exitCode, message.cancelled, {
 					truncation: message.meta?.truncation,
 				});
-				this.ctx.chatContainer.addChild(component);
+				sink.addChild(component);
 				break;
 			}
 			case "hookMessage":
 			case "custom": {
 				if (message.display) {
 					if (message.customType === "async-result") {
-						this.ctx.chatContainer.addChild(buildAsyncResultBlock(message));
+						sink.addChild(buildAsyncResultBlock(message));
 						break;
 					}
 					if (message.customType === LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE) {
@@ -174,18 +319,18 @@ export class UiHelpers {
 						).details;
 						const component = new LateDiagnosticsMessageComponent(details?.files ?? []);
 						component.setExpanded(this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(component);
+						sink.addChild(component);
 						break;
 					}
 					if (message.customType === COLLAB_PROMPT_MESSAGE_TYPE) {
 						const component = new CollabPromptMessageComponent(message as CustomMessage<CollabPromptDetails>);
-						this.ctx.chatContainer.addChild(component);
+						sink.addChild(component);
 						break;
 					}
 					if (message.customType === SKILL_PROMPT_MESSAGE_TYPE) {
 						const component = new SkillMessageComponent(message as CustomMessage<SkillPromptDetails>);
 						component.setExpanded(this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(component);
+						sink.addChild(component);
 						break;
 					}
 					if (
@@ -194,18 +339,16 @@ export class UiHelpers {
 						message.customType === "irc:relay"
 					) {
 						const card = buildIrcMessageCard(message, () => this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(card);
+						sink.addChild(card);
 						return [card];
 					}
 					if (message.customType === "advisor") {
 						const details = (message as CustomMessage<AdvisorMessageDetails>).details;
-						this.ctx.chatContainer.addChild(
-							createAdvisorMessageCard(details, () => this.ctx.toolOutputExpanded, theme),
-						);
+						sink.addChild(createAdvisorMessageCard(details, () => this.ctx.toolOutputExpanded, theme));
 						break;
 					}
 					if (message.customType === BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE) {
-						this.ctx.chatContainer.addChild(createBackgroundTanDispatchBlock(message as CustomMessage<unknown>));
+						sink.addChild(createBackgroundTanDispatchBlock(message as CustomMessage<unknown>));
 						break;
 					}
 					const handoffComponent = createHandoffSummaryMessageComponent(
@@ -213,33 +356,33 @@ export class UiHelpers {
 						this.ctx.toolOutputExpanded,
 					);
 					if (handoffComponent) {
-						this.ctx.chatContainer.addChild(handoffComponent);
+						sink.addChild(handoffComponent);
 						break;
 					}
 					const renderer = this.ctx.viewSession.extensionRunner?.getMessageRenderer(message.customType);
 					// Both HookMessage and CustomMessage have the same structure, cast for compatibility
 					const component = new CustomMessageComponent(message as CustomMessage<unknown>, renderer);
 					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
+					sink.addChild(component);
 				}
 				break;
 			}
 			case "compactionSummary": {
 				const component = new CompactionSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				sink.addChild(component);
 				break;
 			}
 			case "branchSummary": {
 				const component = new BranchSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				sink.addChild(component);
 				break;
 			}
 			case "fileMention": {
 				// Render compact file mention display
 				const block = buildFileMentionBlock(message.files, 0);
-				if (block.children.length > 0) this.ctx.chatContainer.addChild(block);
+				if (block.children.length > 0) sink.addChild(block);
 				break;
 			}
 			case "user":
@@ -263,7 +406,7 @@ export class UiHelpers {
 						userComponent = new UserMessageComponent(textContent, isSynthetic, imageLinks);
 						this.ctx.transcriptMessageComponents.set(message, userComponent);
 					}
-					this.ctx.chatContainer.addChild(userComponent);
+					sink.addChild(userComponent);
 					if (options?.populateHistory && message.role === "user" && !isSynthetic) {
 						this.ctx.editor.addToHistory(textContent);
 					}
@@ -281,7 +424,7 @@ export class UiHelpers {
 				if (cached !== assistantComponent) {
 					this.ctx.transcriptMessageComponents.set(message, assistantComponent);
 				}
-				this.ctx.chatContainer.addChild(assistantComponent);
+				sink.addChild(assistantComponent);
 				break;
 			}
 			case "toolResult": {
@@ -302,11 +445,41 @@ export class UiHelpers {
 	 * @param options.populateHistory Add user messages to editor history
 	 */
 	renderSessionContext(sessionContext: SessionContext, options: RenderSessionContextOptions = {}): void {
+		const range = this.#renderTranscriptRange(sessionContext, options, {
+			start: 0,
+			end: sessionContext.messages.length,
+			pendingTools: this.ctx.pendingTools,
+			seedLastAssistantUsage: undefined,
+			trailing: "tail",
+		});
+		// Full replay: pump the range generator to completion in one go. The
+		// yields exist for the windowed resume path (see renderInitialMessages),
+		// which pumps the same generator in event-loop-bounded chunks.
+		while (!range.next().done) {
+			// drain
+		}
+		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * Reconstruct transcript components for context messages [start, end).
+	 * Yields after each message so a caller can bound event-loop occupancy; the
+	 * loop state (read-group merging, deferred usage rows, displaceable
+	 * snapshots) lives on the generator frame, so a chunked prefix replay is
+	 * byte-identical to an uninterrupted one.
+	 */
+	*#renderTranscriptRange(
+		sessionContext: SessionContext,
+		options: RenderSessionContextOptions,
+		runtime: TranscriptRangeRuntime,
+	): Generator<void, void, void> {
+		const sink = this.#transcriptSink ?? this.#defaultTranscriptSink;
 		// Preserved: message_start handler owns this lifecycle (see #783)
-		this.ctx.pendingTools.clear();
+		const pendingTools = runtime.pendingTools;
+		pendingTools.clear();
 		// Reseed the cache-invalidation baseline: this rebuild re-derives every
 		// turn's marker from usage, and the last turn becomes the live baseline.
-		this.ctx.lastAssistantUsage = undefined;
+		this.ctx.lastAssistantUsage = runtime.seedLastAssistantUsage;
 
 		if (options.updateFooter) {
 			this.ctx.statusLine.invalidate();
@@ -339,7 +512,7 @@ export class UiHelpers {
 			if (!usageAttached) {
 				readGroup?.seal();
 				readGroup = null;
-				this.ctx.chatContainer.addChild(
+				sink.addChild(
 					createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft, pendingUsageTimestamp),
 				);
 			}
@@ -358,12 +531,8 @@ export class UiHelpers {
 			const previous = waitingPoll;
 			if (!previous) return;
 			waitingPoll = null;
-			if (
-				nextToolName === "hub" &&
-				previous.isDisplaceableBlock() &&
-				this.ctx.chatContainer.isBlockUncommitted(previous)
-			) {
-				this.ctx.chatContainer.removeChild(previous);
+			if (nextToolName === "hub" && previous.isDisplaceableBlock() && sink.isBlockUncommitted(previous)) {
+				sink.removeChild(previous);
 			}
 			// Sealing freezes the block and stops the waiting-poll spinner that
 			// updateResult armed.
@@ -379,8 +548,8 @@ export class UiHelpers {
 			}
 			if (previous.canBeDisplacedBy(nextToolName)) {
 				todoSnapshot = null;
-				if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
-					this.ctx.chatContainer.removeChild(previous);
+				if (sink.isBlockUncommitted(previous)) {
+					sink.removeChild(previous);
 				}
 				previous.seal();
 				return;
@@ -390,15 +559,14 @@ export class UiHelpers {
 			previous.seal();
 		};
 		const messages = sessionContext.messages;
-		const count = messages.length;
-		for (let i = 0; i < count; i++) {
+		for (let i = runtime.start; i < runtime.end; i++) {
 			const message = messages[i]!;
 			if (message.role !== "toolResult") flushPendingUsage();
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				const timeline = splitAssistantMessageToolTimeline(message);
 				this.ctx.addMessageToChat(message, { reuseSettledComponent: options.reuseSettledComponents });
-				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
+				const lastChild = sink.lastChild();
 				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
 				if (assistantComponent) {
 					const usage = message.usage;
@@ -426,7 +594,7 @@ export class UiHelpers {
 				const appendAssistantSegment = (segment: AssistantMessage | undefined) => {
 					if (!segment || !assistantHasVisibleContent(segment)) return;
 					const component = createAssistantMessageComponent(this.ctx, segment);
-					this.ctx.chatContainer.addChild(component);
+					sink.addChild(component);
 				};
 
 				// Render tool call components
@@ -449,7 +617,7 @@ export class UiHelpers {
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								readGroup.setToolActivityVisible(!this.ctx.hideToolActivity);
-								this.ctx.chatContainer.addChild(readGroup);
+								sink.addChild(readGroup);
 							}
 							readGroup.updateArgs(content.arguments, content.id);
 							readGroup.updateResult(
@@ -464,10 +632,10 @@ export class UiHelpers {
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								readGroup.setToolActivityVisible(!this.ctx.hideToolActivity);
-								this.ctx.chatContainer.addChild(readGroup);
+								sink.addChild(readGroup);
 							}
 							readGroup.updateArgs(content.arguments, content.id);
-							this.ctx.pendingTools.set(content.id, readGroup);
+							pendingTools.set(content.id, readGroup);
 							if (assistantComponent) {
 								readToolCallAssistantComponents.set(content.id, assistantComponent);
 							}
@@ -517,7 +685,7 @@ export class UiHelpers {
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					component.setToolActivityVisible(!this.ctx.hideToolActivity);
-					this.ctx.chatContainer.addChild(component);
+					sink.addChild(component);
 
 					if (hasErrorStop && errorMessage) {
 						component.updateResult(
@@ -526,7 +694,7 @@ export class UiHelpers {
 							content.id,
 						);
 					} else {
-						this.ctx.pendingTools.set(content.id, component);
+						pendingTools.set(content.id, component);
 					}
 					appendAssistantSegment(afterToolSegment);
 				}
@@ -537,9 +705,7 @@ export class UiHelpers {
 				// lines" transcript trap).
 				const strippedToolCalls = (message as AgentMessage & StrippedToolCallsMarker).strippedToolCalls ?? 0;
 				if (strippedToolCalls > 0) {
-					this.ctx.chatContainer.addChild(
-						new StrippedToolCallsPlaceholder(strippedToolCalls, !this.ctx.hideToolActivity),
-					);
+					sink.addChild(new StrippedToolCallsPlaceholder(strippedToolCalls, !this.ctx.hideToolActivity));
 				}
 				pendingUsage =
 					this.ctx.settings.get("display.showTokenUsage") && assistantUsageIsBilled(message.usage)
@@ -551,7 +717,7 @@ export class UiHelpers {
 				pendingReadUsageCallIds = pendingUsage ? groupedReadUsageCallIds(message) : undefined;
 			} else if (message.role === "toolResult") {
 				if (options.preservedLiveToolCallIds?.has(message.toolCallId)) continue;
-				const pendingReadComponent = this.ctx.pendingTools.get(message.toolCallId);
+				const pendingReadComponent = pendingTools.get(message.toolCallId);
 				const isReadGroupResult =
 					message.toolName === "read" &&
 					(!pendingReadComponent || pendingReadComponent instanceof ReadToolGroupComponent);
@@ -569,7 +735,7 @@ export class UiHelpers {
 							continue;
 						}
 					}
-					let component = this.ctx.pendingTools.get(message.toolCallId);
+					let component = pendingTools.get(message.toolCallId);
 					if (!component) {
 						if (!readGroup) {
 							readGroup = new ReadToolGroupComponent({
@@ -577,27 +743,27 @@ export class UiHelpers {
 							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
 							readGroup.setToolActivityVisible(!this.ctx.hideToolActivity);
-							this.ctx.chatContainer.addChild(readGroup);
+							sink.addChild(readGroup);
 						}
 						const args = readToolCallArgs.get(message.toolCallId);
 						if (args) {
 							readGroup.updateArgs(args, message.toolCallId);
 						}
 						component = readGroup;
-						this.ctx.pendingTools.set(message.toolCallId, readGroup);
+						pendingTools.set(message.toolCallId, readGroup);
 					}
 					component.updateResult(message, false, message.toolCallId);
-					this.ctx.pendingTools.delete(message.toolCallId);
+					pendingTools.delete(message.toolCallId);
 					readToolCallArgs.delete(message.toolCallId);
 					readToolCallAssistantComponents.delete(message.toolCallId);
 					continue;
 				}
 
 				// Match tool results to pending tool components
-				const component = this.ctx.pendingTools.get(message.toolCallId);
+				const component = pendingTools.get(message.toolCallId);
 				if (component) {
 					component.updateResult(message, false, message.toolCallId);
-					this.ctx.pendingTools.delete(message.toolCallId);
+					pendingTools.delete(message.toolCallId);
 					if (
 						message.toolName === "hub" &&
 						component instanceof ToolExecutionComponent &&
@@ -625,6 +791,7 @@ export class UiHelpers {
 				// All other messages use standard rendering
 				this.ctx.addMessageToChat(message, options);
 			}
+			yield;
 		}
 		flushPendingUsage();
 
@@ -640,7 +807,10 @@ export class UiHelpers {
 		// hand it back to the controller so a follow-up `todo` update keeps
 		// displacing instead of stacking. Idle rebuilds (resume / compaction)
 		// fall through to the seal path so the snapshot freezes as history.
-		if (todoSnapshot && this.ctx.viewSession.isStreaming) {
+		// "boundary" ranges always seal: the user prompt right after the range
+		// takes this exact path in a full replay, and the streaming handoff only
+		// exists at the true transcript tail.
+		if (runtime.trailing === "tail" && todoSnapshot && this.ctx.viewSession.isStreaming) {
 			this.ctx.eventController?.inheritDisplaceableTodo(todoSnapshot);
 			todoSnapshot = null;
 		} else {
@@ -659,20 +829,21 @@ export class UiHelpers {
 		// (`rebuildChatFromMessages` builds its context WITHOUT dangling calls and
 		// restores its own preserved live components afterwards — for that caller
 		// the map is empty here either way.)
-		if (this.ctx.viewSession.isStreaming) {
-			for (const [toolCallId, component] of this.ctx.pendingTools) {
+		if (runtime.trailing === "tail" && this.ctx.viewSession.isStreaming) {
+			for (const [toolCallId, component] of pendingTools) {
 				component.setArgsComplete(toolCallId);
 			}
 		} else {
-			for (const component of this.ctx.pendingTools.values()) {
+			for (const component of pendingTools.values()) {
 				component.seal();
 			}
-			this.ctx.pendingTools.clear();
+			pendingTools.clear();
 		}
-		this.ctx.ui.requestRender();
 	}
 
 	renderInitialMessages(options: RenderInitialMessagesOptions = {}): void {
+		// A superseded backfill must never front-insert into the fresh render.
+		this.#cancelTranscriptBackfill();
 		// This path is used to rebuild the visible chat transcript (e.g. after custom/debug UI).
 		// Clear existing rendered chat first to avoid duplicating the full session in the container.
 		// On a non-preserving rebuild the existing blocks are discarded for good, so
@@ -699,10 +870,15 @@ export class UiHelpers {
 			collapseCompactedHistory: settings.get("display.collapseCompacted"),
 			keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 		});
-		this.ctx.renderSessionContext(context, {
-			updateFooter: true,
-			populateHistory: !this.ctx.focusedAgentId,
-		});
+		const windowPlan = this.#planTranscriptWindow(context.messages);
+		if (windowPlan === null) {
+			this.ctx.renderSessionContext(context, {
+				updateFooter: true,
+				populateHistory: !this.ctx.focusedAgentId,
+			});
+		} else {
+			this.#renderWindowedTranscript(context, windowPlan);
+		}
 
 		// Show compaction info if session was compacted
 		const allEntries = this.ctx.viewSession.sessionManager.getEntries();
@@ -725,6 +901,227 @@ export class UiHelpers {
 			}
 			this.ctx.ui.requestRender();
 		}
+	}
+
+	/**
+	 * Resume path for large transcripts: synchronously render only the tail
+	 * window [plan.cut, end) so the first paint lands fast, then backfill the
+	 * older prefix [0, plan.cut) in event-loop-bounded chunks. The cut sits
+	 * right before a user prompt with every tool call/result pair kept on one
+	 * side (#findSafeWindowCut), so the concatenated transcript is
+	 * byte-identical to a full replay once the backfill completes.
+	 */
+	#renderWindowedTranscript(context: SessionContext, plan: TranscriptWindowPlan): void {
+		// The whole-transcript side effects of a full render stay synchronous and
+		// in transcript order: thinking-content detection (a cheap early-exit
+		// scan, normally done by the ctx.renderSessionContext wrapper) and editor
+		// history (Up-arrow recall must end oldest→newest even though the tail
+		// renders first, so per-message populateHistory stays off below).
+		for (const message of context.messages) {
+			this.ctx.noteDisplayableThinkingContent(message);
+		}
+		if (!this.ctx.focusedAgentId) {
+			for (const message of context.messages) {
+				if (message.role !== "user" || (message.synthetic ?? false)) continue;
+				const text = this.getUserMessageText(message);
+				if (text) this.ctx.editor.addToHistory(text);
+			}
+		}
+		const range = this.#renderTranscriptRange(
+			context,
+			{ updateFooter: true, populateHistory: false },
+			{
+				start: plan.cut,
+				end: context.messages.length,
+				pendingTools: this.ctx.pendingTools,
+				seedLastAssistantUsage: plan.carryUsage,
+				trailing: "tail",
+			},
+		);
+		while (!range.next().done) {
+			// Synchronous window render; the plan sizes it to the first-paint budget.
+		}
+		this.ctx.ui.requestRender();
+		this.#scheduleTranscriptBackfill(context, plan.cut);
+	}
+
+	/**
+	 * Size the initial tail window and pick a safe cut for it. Returns null when
+	 * the transcript is small enough for a full render or no safe cut exists.
+	 */
+	#planTranscriptWindow(messages: AgentMessage[]): TranscriptWindowPlan | null {
+		const config = this.#windowConfig;
+		const count = messages.length;
+		if (count < config.minTotalMessages) return null;
+		// Mid-turn rebuilds keep dangling tool calls wired for live routing; the
+		// window boundary cannot represent that, so they replay in full.
+		if (this.ctx.viewSession.isStreaming) return null;
+		let cut = count;
+		let bytes = 0;
+		let windowMessages = 0;
+		while (cut > 0 && windowMessages < config.maxWindowMessages) {
+			if (windowMessages >= config.minWindowMessages && bytes >= config.windowByteBudget) break;
+			cut--;
+			bytes += estimateMessageRenderBytes(messages[cut]!);
+			windowMessages++;
+		}
+		if (cut <= 0) return null; // the window would cover the whole transcript anyway
+		const safeCut = this.#findSafeWindowCut(messages, cut);
+		if (safeCut === null || safeCut <= 0 || safeCut >= count) return null;
+		// The window's first assistant turn derives its cache-invalidation marker
+		// against the prefix's last billed usage — carry it across the cut.
+		let carryUsage: Usage | undefined;
+		for (let i = safeCut - 1; i >= 0; i--) {
+			const message = messages[i]!;
+			if (message.role !== "assistant") continue;
+			const usage = message.usage;
+			if (usage.cacheRead + usage.cacheWrite + usage.input > 0) {
+				carryUsage = usage;
+				break;
+			}
+		}
+		return { cut: safeCut, carryUsage };
+	}
+
+	/**
+	 * Snap a candidate cut forward to the next boundary a split replay can
+	 * reproduce exactly: right before a user prompt (which in a full replay
+	 * seals any open read group and every displaceable snapshot, so neither the
+	 * prefix nor the window needs carried references to each other's blocks),
+	 * and with every tool call/result pair on one side of the cut (each range
+	 * pairs results against its own registry; a straddling pair would orphan).
+	 */
+	#findSafeWindowCut(messages: AgentMessage[], candidate: number): number | null {
+		const count = messages.length;
+		let cut = candidate;
+		for (let attempts = 0; attempts < 8; attempts++) {
+			while (cut < count && messages[cut]!.role !== "user") cut++;
+			if (cut >= count) break;
+			if (cut <= 0) return null;
+			const straddle = firstStraddlingToolResult(messages, cut);
+			if (straddle === -1) return cut;
+			// A window result belongs to a prefix call: grow the prefix past it.
+			cut = straddle + 1;
+		}
+		// No user prompt at/after the candidate — the transcript ends in one
+		// giant turn (the norm for heavy agentic sessions). Grow the window
+		// backward to the nearest earlier prompt boundary instead; it may exceed
+		// maxWindowMessages, but a slower first paint beats replaying the whole
+		// transcript (the null fallback, i.e. the old behavior).
+		for (let back = candidate - 1; back > 0; back--) {
+			if (messages[back]!.role !== "user") continue;
+			if (firstStraddlingToolResult(messages, back) === -1) return back;
+		}
+		return null;
+	}
+
+	#scheduleTranscriptBackfill(context: SessionContext, cut: number): void {
+		const container = this.ctx.chatContainer;
+		const state: TranscriptBackfillState = {
+			epoch: container.getMutationEpoch(),
+			sink: {
+				addChild: component => {
+					container.insertChildAt(state.insertIndex, component);
+					state.insertIndex++;
+				},
+				removeChild: component => {
+					const index = container.children.indexOf(component);
+					container.removeChild(component);
+					if (index >= 0 && index < state.insertIndex) state.insertIndex--;
+				},
+				isBlockUncommitted: component => container.isBlockUncommitted(component),
+				lastChild: () => (state.insertIndex > 0 ? container.children[state.insertIndex - 1] : undefined),
+			},
+			range: this.#renderTranscriptRange(
+				context,
+				{ updateFooter: false, populateHistory: false },
+				{
+					start: 0,
+					end: cut,
+					pendingTools: new Map<string, ToolExecutionHandle>(),
+					seedLastAssistantUsage: undefined,
+					trailing: "boundary",
+				},
+			),
+			insertIndex: 0,
+			prefixUsage: undefined,
+			scheduled: false,
+		};
+		this.#backfill = state;
+		// No transcript row may commit to native scrollback while older blocks
+		// are still being front-inserted above it.
+		container.setBackfillPinned(true);
+		this.#pumpTranscriptBackfillSoon(state);
+	}
+
+	#pumpTranscriptBackfillSoon(state: TranscriptBackfillState): void {
+		if (state.scheduled) return;
+		state.scheduled = true;
+		setImmediate(() => {
+			state.scheduled = false;
+			this.#pumpTranscriptBackfill(state);
+		});
+	}
+
+	#pumpTranscriptBackfill(state: TranscriptBackfillState): void {
+		if (this.#backfill !== state) return; // superseded by a newer initial render
+		const container = this.ctx.chatContainer;
+		if (container.getMutationEpoch() !== state.epoch) {
+			// The container was cleared and rebuilt (session switch, compaction,
+			// theme replay); that rebuild owns the transcript now, and the clear
+			// already released the backfill pin.
+			this.#backfill = null;
+			return;
+		}
+		// Park the live cache-invalidation baseline for the chunk's duration:
+		// the prefix replay tracks its own, and the live value must survive
+		// untouched for the next real turn.
+		const liveUsage = this.ctx.lastAssistantUsage;
+		this.ctx.lastAssistantUsage = state.prefixUsage;
+		this.#transcriptSink = state.sink;
+		const deadline = performance.now() + this.#windowConfig.chunkBudgetMs;
+		let done = false;
+		try {
+			const width = container.getLastRenderWidth();
+			do {
+				const before = state.insertIndex;
+				if (state.range.next().done) {
+					done = true;
+					break;
+				}
+				if (width > 0) {
+					// Warm each new block's per-width render cache inside the time
+					// budget so the next frame reuses rows instead of re-rendering.
+					for (let i = before; i < state.insertIndex; i++) {
+						container.children[i]!.render(width);
+					}
+				}
+			} while (performance.now() < deadline);
+		} finally {
+			this.#transcriptSink = null;
+			state.prefixUsage = this.ctx.lastAssistantUsage;
+			this.ctx.lastAssistantUsage = liveUsage;
+		}
+		if (done) {
+			this.#backfill = null;
+			// History is complete; rows above the viewport may commit again.
+			container.setBackfillPinned(false);
+			this.ctx.ui.requestRender();
+			return;
+		}
+		this.ctx.ui.requestRender();
+		this.#pumpTranscriptBackfillSoon(state);
+	}
+
+	#cancelTranscriptBackfill(): void {
+		if (this.#backfill === null) return;
+		this.#backfill = null;
+		this.ctx.chatContainer.setBackfillPinned(false);
+	}
+
+	/** Test hook: whether a lazy prefix backfill is still pumping. */
+	hasPendingTranscriptBackfill(): boolean {
+		return this.#backfill !== null;
 	}
 
 	clearEditor(): void {
