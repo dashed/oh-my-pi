@@ -95,6 +95,7 @@ import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" wit
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
 };
+import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	type AgentSession,
@@ -148,6 +149,7 @@ import {
 	type VibeParentSession,
 	VibeSessionRegistry,
 } from "../vibe/runtime";
+import { AgentPanelComponent } from "./components/agent-panel";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import { ChatBlock, type ChatBlockHost } from "./components/chat-block";
@@ -418,6 +420,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	editorContainer: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
+	agentPanelContainer: Container;
 	statusLine: StatusLineComponent;
 
 	isInitialized = false;
@@ -618,6 +621,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	#voicePreviousUseTerminalCursor: boolean | null = null;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
+	readonly #agentPanel: AgentPanelComponent;
+	#agentPanelRegistryUnsubscribe?: () => void;
+	#agentPanelRegistryTarget?: AgentRegistry;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#observerUiSyncTimer?: NodeJS.Timeout;
@@ -726,6 +732,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerAbove = new Container();
 		this.hookWidgetContainerAbove.addChild(new Spacer(1));
 		this.hookWidgetContainerBelow = new Container();
+		// Anchored live region for the agent panel: mounted below the editor and
+		// hook widgets, it gets the same seam-0 scrollback protection as the HUDs
+		// above the editor while it has content.
+		this.agentPanelContainer = new AnchoredLiveContainer();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
 		this.statusLine = new StatusLineComponent(session);
@@ -785,6 +795,29 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#focusController = new SessionFocusController(this);
 		this.#inputController = new InputController(this);
 		this.#observerRegistry = new SessionObserverRegistry();
+		// The agent panel reads the badge registry lazily (collab guests attach
+		// their registry after construction) and shares the observer registry with
+		// the subagent HUD. Key lists are read live so a mid-session rebind lands.
+		this.#agentPanel = new AgentPanelComponent({
+			getRegistry: () => getRunningSubagentBadgeRegistry(this.collabGuest),
+			observers: this.#observerRegistry,
+			ui: this.ui,
+			editor: this.editor,
+			requestRender: () => this.ui.requestRender(),
+			focusAgent: id => this.focusAgentSession(id),
+			remote: () => this.collabGuest?.hubRemote,
+			lifecycle: () => AgentLifecycleManager.global(),
+			getTool: name => this.session.getToolByName(name),
+			getMessageRenderer: type => this.session.extensionRunner?.getMessageRenderer(type),
+			cwd: this.sessionManager.getCwd(),
+			hideThinkingBlock: () => this.effectiveHideThinkingBlock,
+			proseOnlyThinking: () => this.proseOnlyThinking,
+			expandKeys: () => this.keybindings.getKeys("app.tools.expand"),
+			hubKeys: () => [
+				...this.keybindings.getKeys("app.agents.hub"),
+				...this.keybindings.getKeys("app.session.observe"),
+			],
+		});
 	}
 
 	#handleMcpConnectionStatusEvent(event: McpConnectionStatusEvent): void {
@@ -960,6 +993,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
+		this.ui.addChild(this.agentPanelContainer);
 		this.ui.setFocus(this.editor);
 
 		this.#inputController.setupKeyHandlers();
@@ -974,6 +1008,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#observerRegistry.onChange(kind => {
 			this.#scheduleObserverUiSync(kind);
 		});
+		// Establishes the panel's badge-registry subscription and renders its
+		// initial (normally empty) state; later updates arrive via the observer
+		// flush and that subscription.
+		this.#syncAgentPanel();
 		// Let the transient todo tool result light up pending todos executed by a
 		// live subagent, matching the sticky HUD's active set (#5873).
 		setActiveTodoDescriptionsProvider(() => this.#getActiveSubagentDescriptions());
@@ -2095,6 +2133,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#syncTodoAutoClearTimer();
 		this.#renderTodoList();
 		this.#renderSubagentList();
+		this.#syncAgentPanel();
 		this.ui.requestRender();
 		this.#syncHudTickTimer();
 	}
@@ -2242,6 +2281,62 @@ export class InteractiveMode implements InteractiveModeContext {
 		const lines = renderSubagentHudLines(this.#observerRegistry.getSessions(), this.ui.terminal.columns);
 		if (lines.length === 0) return;
 		this.subagentContainer.addChild(new Text(lines.join("\n"), 1, 0));
+	}
+
+	/**
+	 * Keep the panel's subscription on the ACTIVE badge registry — the local
+	 * global normally, the collab guest's registry once a guest link attaches
+	 * (same retarget dance as {@link syncRunningSubagentBadge}).
+	 */
+	#subscribeAgentPanelRegistry(): void {
+		const registry = getRunningSubagentBadgeRegistry(this.collabGuest);
+		if (this.#agentPanelRegistryTarget === registry) return;
+		this.#agentPanelRegistryUnsubscribe?.();
+		this.#agentPanelRegistryTarget = registry;
+		this.#agentPanelRegistryUnsubscribe = registry.onChange(() => this.#syncAgentPanel());
+	}
+
+	/**
+	 * Agent panel sync, run as a sibling of {@link #renderSubagentList} in the
+	 * observer flush (so elapsed/tool/cost cells tick for free via
+	 * `#syncHudTickTimer`) and from the badge registry's own change events (so
+	 * park/release transitions that emit no observer event still retire rows).
+	 *
+	 * The panel lists live (running | idle) subagents and is mounted only while
+	 * at least one exists — or while the observer registry still reports an
+	 * active subagent session, covering the spawn window before registration.
+	 * It hides as soon as zero live subagents remain; no hide timer. Unmounting
+	 * while focused rescues focus back to the editor.
+	 */
+	#syncAgentPanel(): void {
+		this.#subscribeAgentPanelRegistry();
+		const registry = getRunningSubagentBadgeRegistry(this.collabGuest);
+		const live = registry
+			.list()
+			.filter(ref => ref.kind === "sub" && (ref.status === "running" || ref.status === "idle"));
+		const visible = live.length > 0 || this.#hasRunningSubagentSessions();
+		this.#agentPanel.setAgents(live);
+		if (!visible) {
+			if (this.agentPanelContainer.children.length === 0) return;
+			if (this.ui.getFocused() === this.#agentPanel) this.ui.setFocus(this.editor);
+			this.agentPanelContainer.clear();
+			return;
+		}
+		if (this.agentPanelContainer.children.length === 0) {
+			this.agentPanelContainer.addChild(this.#agentPanel);
+		}
+	}
+
+	/**
+	 * alt+↓ / ctrl+↓ entry chord (wired by InputController as editor custom
+	 * keys): drop keyboard focus into the anchored agent panel. Inert while the
+	 * panel is hidden (no live subagents to select), so the chords never
+	 * swallow a key for nothing.
+	 */
+	focusAgentPanel(): void {
+		if (this.agentPanelContainer.children.length === 0) return;
+		this.ui.setFocus(this.#agentPanel);
+		this.ui.requestRender();
 	}
 
 	async #loadTodoList(): Promise<void> {
@@ -4046,6 +4141,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#eventBusUnsubscribers = [];
 		this.#observerRegistry.dispose();
+		this.#agentPanel.dispose();
+		this.#agentPanelRegistryUnsubscribe?.();
+		this.#agentPanelRegistryUnsubscribe = undefined;
+		this.#agentPanelRegistryTarget = undefined;
 		this.#agentRegistryUnsubscribe?.();
 		this.#agentRegistryUnsubscribe = undefined;
 		this.#agentRegistrySubscriptionTarget = undefined;

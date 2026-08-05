@@ -516,6 +516,15 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showAgentHub());
 		}
 
+		// Agent panel entry: alt+↓ (primary) / ctrl+↓ (backup) drop keyboard focus
+		// into the anchored subagent panel below the editor. A dedicated chord —
+		// never Down-past-last-line, which would fight the editor's own cursor /
+		// history navigation — and plain typing/arrow keys are never eaten. Inert
+		// while the panel has no live subagents (focusAgentPanel no-ops).
+		for (const key of ["alt+down", "ctrl+down"] as const) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.focusAgentPanel());
+		}
+
 		// Double-tap left arrow on an empty editor: opens the agent hub from the
 		// main session, or returns the focused subagent view to the main session.
 		// Focused ←← intentionally matches Esc. From the main session the gesture

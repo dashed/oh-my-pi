@@ -4,6 +4,7 @@
 
 ### Added
 
+- Add a persistent agent panel below the prompt editor listing live subagents (shared row renderer with the Agent Hub): `alt+down`/`ctrl+down` to enter, arrows to select, `Enter` to open a teammate's transcript and message it directly, `Esc` to interrupt the selected agent's current turn without killing it.
 - Add a shared team task board via a new `team` tool: tasks live file-backed under `~/.omp/teams/<session>/` with lock-protected claim/complete/release and `blockedBy` dependency gating, so subagents self-coordinate pull-style; claims and completions broadcast over hub.
 - Add OpenRouter routing control: per-provider rolling stats (median tok/s, TTFT p50) persisted to `~/.omp/agent/routing-stats.json` and surfaced by `/provider`, enriched with OpenRouter-reported latency/throughput; slow providers trigger a one-line notice with a ready ban command; `providers.openrouter.{ignore,only,order,sort}` settings apply per request without restart, and `/provider ignore|unignore <slug>` persists bans to `config.yml`.
 - Surface keyboard shortcuts in the UI: contextual footer hints across the agent hub, selectors, dialogs, and editors now render labels from the live keybinding registry, so custom rebinds are reflected; open the full shortcuts panel with `f1` or `ctrl+/` (also `/hotkeys`); welcome splash now hints at it.
