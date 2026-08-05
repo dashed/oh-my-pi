@@ -33,6 +33,8 @@ import { DynamicBorder } from "./dynamic-border";
 
 /** Refresh cadence for the relative-time column */
 const AGE_TICK_MS = 5_000;
+/** Max width for the current-tool name on a running row's meta segment. */
+const HUB_CURRENT_TOOL_MAX = 24;
 const DATA_CHANGE_RENDER_COALESCE_MS = 100;
 /** Double-tap window for the table's left-left "close hub" gesture. */
 const LEFT_TAP_WINDOW_MS = 500;
@@ -523,6 +525,15 @@ export class AgentHubOverlayComponent extends Container {
 			// after a revive or follow-up turn) over the ref's registration time.
 			const startMs = observed?.progress?.startedAtMs ?? ref.createdAt;
 			meta.push(theme.fg("dim", `${theme.icon.time} ${formatDuration(Math.max(0, Date.now() - startMs))}`));
+			// Live progress: the tool currently in flight plus the run's accrued
+			// cost, formatted like the inline task rows' stats segment.
+			const progress = observed?.progress;
+			if (progress?.currentTool) {
+				meta.push(theme.fg("dim", truncateToWidth(replaceTabs(progress.currentTool), HUB_CURRENT_TOOL_MAX)));
+			}
+			if (progress && progress.cost > 0) {
+				meta.push(theme.fg("statusLineCost", `$${progress.cost.toFixed(2)}`));
+			}
 		} else {
 			meta.push(theme.fg("dim", formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))));
 		}

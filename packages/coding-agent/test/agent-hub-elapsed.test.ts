@@ -128,3 +128,91 @@ describe("Agent hub elapsed timer", () => {
 		}
 	});
 });
+
+describe("Agent hub running progress meta", () => {
+	let restoreGeometry: (() => void) | undefined;
+
+	beforeAll(async () => {
+		await initTheme();
+	});
+
+	afterEach(() => {
+		setSystemTime();
+		vi.restoreAllMocks();
+		restoreGeometry?.();
+		restoreGeometry = undefined;
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	function observersWithProgress(id: string, progress: Record<string, unknown>): SessionObserverRegistry {
+		const observers = new SessionObserverRegistry();
+		vi.spyOn(observers, "getSession").mockReturnValue({
+			id,
+			kind: "subagent",
+			label: "Subagent",
+			status: "active",
+			lastUpdate: Date.now(),
+			progress: progress as never,
+		});
+		return observers;
+	}
+
+	it("shows the current tool and accrued cost on a running row, alongside the timer", () => {
+		restoreGeometry = stubStdoutGeometry(120);
+		const agents = new AgentRegistry();
+		setSystemTime(1_000_000);
+		agents.register({ id: "Worker", displayName: "Worker", kind: "sub", session: {} as AgentSession });
+		const hub = makeHub(
+			agents,
+			observersWithProgress("Worker", { startedAtMs: 1_000_000, currentTool: "bash", cost: 0.42 }),
+		);
+		try {
+			setSystemTime(1_000_000 + 10_000);
+			const row = rowFor(hub, "Worker");
+			expect(row).toContain("10.0s");
+			expect(row).toContain("bash");
+			expect(row).toContain("$0.42");
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	it("truncates a long tool name on the meta segment", () => {
+		restoreGeometry = stubStdoutGeometry(120);
+		const agents = new AgentRegistry();
+		setSystemTime(1_000_000);
+		agents.register({ id: "Worker", displayName: "Worker", kind: "sub", session: {} as AgentSession });
+		const longTool = `tool-${"x".repeat(60)}`;
+		const hub = makeHub(agents, observersWithProgress("Worker", { startedAtMs: 1_000_000, currentTool: longTool, cost: 0 }));
+		try {
+			setSystemTime(1_000_000);
+			const row = rowFor(hub, "Worker");
+			expect(row).toContain("tool-xxx");
+			expect(row).not.toContain(longTool);
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	it("keeps tool and cost off non-running rows", () => {
+		restoreGeometry = stubStdoutGeometry(120);
+		const agents = new AgentRegistry();
+		setSystemTime(1_000_000);
+		agents.register({ id: "Idle", displayName: "Idle", kind: "sub", session: {} as AgentSession });
+		setSystemTime(1_000_000 + 5_000);
+		agents.setStatus("Idle", "idle");
+		const hub = makeHub(
+			agents,
+			observersWithProgress("Idle", { startedAtMs: 1_000_000, currentTool: "bash", cost: 0.42 }),
+		);
+		try {
+			setSystemTime(1_000_000 + 5_000 + 300_000);
+			const row = rowFor(hub, "Idle");
+			expect(row).toContain("5m ago");
+			expect(row).not.toContain("bash");
+			expect(row).not.toContain("$0.42");
+		} finally {
+			hub.dispose();
+		}
+	});
+});

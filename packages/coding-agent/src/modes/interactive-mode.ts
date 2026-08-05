@@ -96,7 +96,7 @@ import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" wit
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
 };
-import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -114,6 +114,7 @@ import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } fr
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
+import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../task";
 import { formatTaskId } from "../task/render";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import { tinyTitleClient } from "../tiny/title-client";
@@ -220,6 +221,7 @@ import type {
 	TodoPhase,
 } from "./types";
 import { UiHelpers } from "./utils/ui-helpers";
+import { isWarpCliAgentProtocolActive } from "./warp-events";
 
 const STILL_CLOSING_DELAY_MS = 3_000;
 
@@ -386,15 +388,15 @@ const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
  * inline task rows use (muted task preview when no description was given).
  * Layout mirrors the Todos HUD exactly: unindented header, then
  * `renderTreeList` rows (dim connectors) shifted right by one space.
- * Only detached background spawns are listed: a sync task call blocks the
- * parent turn and its inline tool block already renders progress live, and
- * eval `agent()` spawns are rendered by their own eval cell tree.
+ * Every running subagent is listed — detached background spawns as well as
+ * sync task spawns, whose inline tool block only renders while the parent
+ * turn is on screen. The main session is excluded by kind; advisors never
+ * enter the observer registry at all. A `· <tool>` suffix names the tool
+ * currently in flight when the executor has reported one.
  * Returns an empty array when nothing is running so the container can clear.
  */
 export function renderSubagentHudLines(sessions: ObservableSession[], columns: number): string[] {
-	const running = sessions.filter(
-		session => session.kind === "subagent" && session.status === "active" && session.detached === true,
-	);
+	const running = sessions.filter(session => session.kind === "subagent" && session.status === "active");
 	if (running.length === 0) return [];
 
 	const dot = theme.styledSymbol("status.done", "accent");
@@ -418,6 +420,10 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 					if (taskPreview) {
 						line += ` ${theme.fg("muted", truncateToWidth(replaceTabs(taskPreview), TRUNCATE_LENGTHS.SHORT))}`;
 					}
+				}
+				const currentTool = session.progress?.currentTool?.trim();
+				if (currentTool) {
+					line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(currentTool), TRUNCATE_LENGTHS.SHORT))}`;
 				}
 				return line;
 			},
@@ -663,6 +669,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#observerUiSyncNeedsTodoReconcile = false;
 	#agentRegistryUnsubscribe?: () => void;
 	#agentRegistrySubscriptionTarget?: AgentRegistry;
+	/** `id:status` keys of subagent terminal transitions already notified. */
+	#subagentNotifySent = new Set<string>();
 	#mcpStatusOrder: string[] = [];
 	#mcpPendingServers = new Set<string>();
 	#mcpConnectedServers = new Set<string>();
@@ -707,6 +715,11 @@ export class InteractiveMode implements InteractiveModeContext {
 						return;
 					}
 					this.#handleMcpConnectionStatusEvent(data);
+				}),
+			);
+			this.#eventBusUnsubscribers.push(
+				eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, data => {
+					this.#handleSubagentLifecycleEvent(data as SubagentLifecyclePayload);
 				}),
 			);
 		}
@@ -1746,6 +1759,50 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.editor.borderColor = (str: string) => `\x1b[2m${base(str)}\x1b[22m`;
 		}
 		this.ui.requestRender();
+	}
+
+	/**
+	 * Subagent lifecycle → desktop notification. The main session's turn-end
+	 * notifications only cover the primary agent; subagents settle off-turn, so
+	 * their terminal lifecycle transitions get their own toast, gated by the
+	 * same `completion.notify` / `error.notify` settings that gate the
+	 * main-turn notifications in EventController.
+	 */
+	#handleSubagentLifecycleEvent(payload: SubagentLifecyclePayload): void {
+		// A (re)start re-arms notifications: a revived agent settling its
+		// follow-up run under the same id must notify again.
+		if (payload.status === "started") {
+			for (const key of this.#subagentNotifySent) {
+				if (key.startsWith(`${payload.id}:`)) this.#subagentNotifySent.delete(key);
+			}
+			return;
+		}
+		// One toast per agent id + terminal outcome, no matter how often the
+		// transition repeats.
+		const key = `${payload.id}:${payload.status}`;
+		if (this.#subagentNotifySent.has(key)) return;
+		this.#subagentNotifySent.add(key);
+		// Advisors are observability-only transcripts (excluded from agent
+		// rosters) and never notify; the main agent's turn end has its own
+		// completion/error notifications and never emits on this channel.
+		const ref = AgentRegistry.global().get(payload.id);
+		if (ref && ref.kind !== "sub") return;
+		// Warp structured OSC 777 already drives native completion UX when the
+		// protocol is negotiated — avoid a second legacy desktop/OSC-9 toast.
+		if (isWarpCliAgentProtocolActive()) return;
+
+		const failed = payload.status !== "completed";
+		const notify = settings.get(failed ? "error.notify" : "completion.notify");
+		if (notify === "off") return;
+
+		const label = ref?.displayName ?? payload.id;
+		const sessionName = this.sessionManager.getSessionName();
+		TERMINAL.sendNotification({
+			title: sessionName || "Oh My Pi",
+			body: `Subagent ${label} ${payload.status}`,
+			type: failed ? "error" : "completion",
+			actions: "focus",
+		});
 	}
 
 	/** Refresh the running-subagents status badge from the active local or collab registry. */

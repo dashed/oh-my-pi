@@ -1,9 +1,9 @@
 /**
  * Contract: the anchored subagent HUD (rendered above the editor, next to the
- * Todos block) lists exactly the running *detached* subagents as
- * `Id: description` rows and yields no output once nothing qualifies, so the
- * block self-clears. Sync task spawns and eval `agent()` spawns are excluded:
- * their progress is already rendered inline (tool block / eval cell).
+ * Todos block) lists every running subagent — detached background spawns as
+ * well as sync task spawns — as `Id: description` rows with a `· <tool>`
+ * suffix when the executor has reported a tool in flight, and yields no
+ * output once nothing qualifies, so the block self-clears.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
@@ -133,22 +133,20 @@ describe("subagent HUD lines", () => {
 		expect(fromTask).toContain("Worker Investigate flaky CI on macOS");
 	});
 
-	it("hides non-detached spawns: sync task calls and eval agent() helpers", () => {
+	it("lists non-detached running spawns too: sync task calls and eval agent() helpers", () => {
 		// Sync task spawn (parent blocked on the call) and eval `agent()` spawn
-		// (no detached flag at all) both stay off the HUD.
+		// (no detached flag at all) appear alongside detached background spawns.
 		const sessions = [
 			makeSession({ id: "SyncSpawn", description: "inline task work", detached: false }),
 			makeSession({ id: "EvalSpawn", description: "eval cell work", detached: undefined }),
 		];
-		expect(renderSubagentHudLines(sessions, 120)).toEqual([]);
-
 		const out = render([...sessions, makeSession({ id: "BackgroundSpawn", description: "detached work" })]);
 		expect(out).toContain("BackgroundSpawn: detached work");
-		expect(out).not.toContain("SyncSpawn");
-		expect(out).not.toContain("EvalSpawn");
+		expect(out).toContain("SyncSpawn: inline task work");
+		expect(out).toContain("EvalSpawn: eval cell work");
 	});
 
-	it("threads the detached flag from lifecycle and progress payloads", () => {
+	it("lists lifecycle and progress spawns regardless of the detached flag", () => {
 		const eventBus = new EventBus();
 		const registry = new SessionObserverRegistry();
 		registry.subscribeToEventBus(eventBus);
@@ -160,7 +158,7 @@ describe("subagent HUD lines", () => {
 		const out = render(registry.getSessions());
 		expect(out).toContain("Detached: background work");
 		expect(out).toContain("FromProgress: background work");
-		expect(out).not.toContain("Inline");
+		expect(out).toContain("Inline: sync work");
 	});
 
 	it("renders nested ids as a breadcrumb and truncates long descriptions to the viewport", () => {
@@ -209,7 +207,30 @@ describe("subagent HUD lines", () => {
 		expect(activeIds()).toEqual(["SelectorSurfaces", "BlastRadius", "VariantsSurvey"]);
 	});
 
-	it("renders the first eight active detached subagents and summarizes the rest", () => {
+	it("appends the tool currently in flight as a truncated dim suffix", () => {
+		const out = render([
+			makeSession({
+				id: "Worker",
+				description: "live work",
+				progress: makeProgress({ id: "Worker", currentTool: "bash" }),
+			}),
+		]);
+		expect(out).toContain("Worker: live work");
+		expect(out).toContain("· bash");
+
+		const longTool = `tool-${"x".repeat(100)}`;
+		const truncated = render([
+			makeSession({
+				id: "Worker",
+				description: "live work",
+				progress: makeProgress({ id: "Worker", currentTool: longTool }),
+			}),
+		]);
+		expect(truncated).not.toContain(longTool);
+		expect(truncated).toContain("· tool-xxx");
+	});
+
+	it("renders the first eight active subagents and summarizes the rest", () => {
 		const active = Array.from({ length: 10 }, (_, index) =>
 			makeSession({
 				id: `Worker${index}`,

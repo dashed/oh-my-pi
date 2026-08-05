@@ -15,9 +15,12 @@
 ### Added
 
 - Show a live elapsed-time timer for running subagents in the Agent Hub rows and inline task transcript rows.
+- Show the tool currently in flight and the accrued run cost on running Agent Hub rows, and a `· <tool>` suffix on Subagents HUD rows.
+- Raise a desktop notification when a subagent reaches a terminal state (completed, failed, or aborted), gated by the existing `completion.notify` / `error.notify` settings.
 
 ### Changed
 
+- The Subagents HUD now lists every running subagent, including synchronous task spawns, instead of only detached background spawns.
 - Restored the legacy project-scoped session directory naming scheme and removed its automatic migration ([#7646](https://github.com/can1357/oh-my-pi/issues/7646)).
 - Routed Bun install-cache pruning in `update-cli` through the shared `compareVersions` utility (`@oh-my-pi/pi-utils`), removing a duplicate local comparator that rounded large numeric version identifiers via `Number`.
 
